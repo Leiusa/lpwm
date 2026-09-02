@@ -389,8 +389,9 @@ Please see our tutorial if you are you new to Deep Latent Particles, where you c
 | `/eval/eval_model.py`                                | evaluation functions such as evaluating the ELBO                                             |
 | `/eval/eval_gen_metrics.py`                          | evaluation functions for image metrics (LPIPS, PSNR, SSIM)                                   |
 | `/modules/modules.py`                                | basic neural network blocks used to implement DLPv3                                          |
+| `/lpwm_stn`                                          | isolated Spatial Transformer Network reference and backend boundary                           |
 | `/utils/loss_functions.py`                           | loss functions used to optimize the model such as Chamfer-KL and perceptual (VGG/LPIPS) loss |
-| `/utils/util_func.py`                                | utility functions such as logging and plotting functions, Spatial Transformer Network (STN)  |
+| `/utils/util_func.py`                                | utility functions such as logging and plotting functions                                     |
 | `models.py`                                          | implementation of DLPv3 and LPWM                                                             |
 | `train_dlp.py`/`train_lpwm.py`                       | training function of DLP/LPWM for single-GPU machines                                        |
 | `train_dlp_accelerate.py`/`train_lpwm_accelerate.py` | training function of DLP/LPWM for multi-GPU machines                                         |

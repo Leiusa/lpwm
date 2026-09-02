@@ -8,8 +8,8 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.distributions import Beta
-from utils.util_func import reparameterize, spatial_transform, create_masks_fast, create_masks_with_scale, \
-    modulate
+from lpwm_stn import create_masks_fast, create_masks_with_scale, stn_crop, stn_paste
+from utils.util_func import reparameterize, modulate
 # modules
 from modules.vision_modules import Encoder, Decoder
 
@@ -2818,19 +2818,9 @@ class ParticleAttributeEncoder(nn.Module):
     def forward(self, x, kp, z_scale=None, timesteps=None, deterministic=False):
         # x: [bs, ch, image_size, image_size]
         # kp: [bs, n_kp, 2] in [-1, 1]
-        batch_size, _, _, img_size = x.shape
+        batch_size = x.shape[0]
         _, n_kp, _ = kp.shape
-        x_repeated = x.unsqueeze(1).repeat(1, n_kp, 1, 1, 1)  # [batch_size, n_kp, ch, image_size, image_size]
-        x_repeated = x_repeated.view(-1, *x.shape[1:])  # [batch_size * n_kp, ch, image_size, image_size]
-        if z_scale is None:
-            z_scale = (self.patch_size / img_size) * torch.ones_like(kp)
-        else:
-            # assume unnormalized z_scale
-            z_scale = torch.sigmoid(z_scale)
-        z_pos = kp.reshape(-1, kp.shape[-1])
-        z_scale = z_scale.view(-1, z_scale.shape[-1])
-        out_dims = (batch_size * n_kp, x.shape[1], self.patch_size, self.patch_size)
-        cropped_objects = spatial_transform(x_repeated, z_pos, z_scale, out_dims, inverse=False, padding_mode='border')
+        cropped_objects = stn_crop(x, kp, self.patch_size, z_scale=z_scale, padding_mode='border')
         # [batch_size * n_kp, ch, patch_size, patch_size]
 
         # encode objects - fc
@@ -3013,18 +3003,7 @@ class ParticleFeaturesEncoder(nn.Module):
         # kp: [bs, n_kp, 2] in [-1, 1]
         batch_size = x.shape[0]
         n_kp = kp.shape[1]
-        img_size = x.shape[-1]
-        x_repeated = x.unsqueeze(1).repeat(1, n_kp, 1, 1, 1)  # [batch_size, n_kp, ch, image_size, image_size]
-        x_repeated = x_repeated.view(-1, *x.shape[1:])  # [batch_size * n_kp, ch, image_size, image_size]
-        if z_scale is None:
-            z_scale = (self.patch_size / img_size) * torch.ones_like(kp)
-        else:
-            # assume unnormalized z_scale
-            z_scale = torch.sigmoid(z_scale)
-        z_pos = kp.reshape(-1, kp.shape[-1])
-        z_scale = z_scale.view(-1, z_scale.shape[-1])
-        out_dims = (batch_size * n_kp, x.shape[1], self.patch_size, self.patch_size)
-        cropped_objects = spatial_transform(x_repeated, z_pos, z_scale, out_dims, inverse=False, padding_mode='border')
+        cropped_objects = stn_crop(x, kp, self.patch_size, z_scale=z_scale, padding_mode='border')
         # [batch_size * n_kp, ch, patch_size, patch_size]
 
         # encode objects - fc
@@ -5309,25 +5288,8 @@ class DLPDecoder(nn.Module):
         scale_normalized: False if scale is not in [0, 1]
         :return: translated_padded_patches [bs, n_kp, ch, img_size, img_size]
         """
-        batch_size, n_kp, ch_patch, patch_size, _ = patches_batch.shape
-        # img_size = self.image_size
-        img_size = self.feature_map_size
-        if scale is None:
-            z_scale = (patch_size / img_size) * torch.ones_like(kp_batch)
-        else:
-            # normalize to [0, 1]
-            if scale_normalized:
-                z_scale = scale
-            else:
-                z_scale = torch.sigmoid(scale)  # -> [0, 1]
-        z_pos = kp_batch.reshape(-1, kp_batch.shape[-1])  # [bs * n_kp, 2]
-        z_scale = z_scale.view(-1, z_scale.shape[-1])  # [bs * n_kp, 2]
-        patches_batch = patches_batch.reshape(-1, *patches_batch.shape[2:])
-        out_dims = (batch_size * n_kp, ch_patch, img_size, img_size)
-        trans_patches_batch = spatial_transform(patches_batch, z_pos, z_scale, out_dims, inverse=True)
-        trans_padded_patches_batch = trans_patches_batch.view(batch_size, n_kp, *trans_patches_batch.shape[1:])
-        # [bs, n_kp, ch, img_size, img_size]
-        return trans_padded_patches_batch
+        return stn_paste(kp_batch, patches_batch, self.feature_map_size, scale=scale,
+                         translation=translation, scale_normalized=scale_normalized)
 
     def get_objects_alpha_rgb(self, z_kp, z_features, z_scale=None, z_ctx=None, translation=None):
         # decode the latent particles into RGBA glimpses and place them on the canvas
