@@ -30,6 +30,7 @@ Usage
     python tests/stn/test_stn.py --scope all           # include full config shapes
     python tests/stn/test_stn.py --backend triton      # check a custom kernel
     python tests/stn/test_stn.py --gradcheck           # verify a backward from scratch
+    python tests/stn/test_stn.py --backend triton --live-forward --live-gradients
     pytest tests/stn/test_stn.py                       # if pytest is installed
 """
 
@@ -167,6 +168,110 @@ def check_live_forward(case, impl, device, tol):
     if worst > tol:
         raise golden.TensorMismatch(
             f"{case.name}:live-forward max|diff|={worst:.3e} > tol={tol:.3e}")
+
+
+def check_live_gradients(case, impl, device, tol):
+    """Compare every input-gradient element to a freshly computed reference.
+
+    This is deliberately separate from the fixture check: full tensors are not
+    stored for the real workloads, and a reduction-only comparison can hide
+    compensating errors in a hand-written backward.
+    """
+    reference_inputs = case.inputs(device=device)
+    actual_inputs = case.inputs(device=device)
+    reference_out = case.run(reference, reference_inputs)
+    cotangent = case.cotangent(reference_out)
+    reference_grads = torch.autograd.grad(
+        reference_out, [reference_inputs[key] for key in case.grad_wrt],
+        grad_outputs=cotangent, allow_unused=False)
+    actual_out = case.run(impl, actual_inputs)
+    actual_grads = torch.autograd.grad(
+        actual_out, [actual_inputs[key] for key in case.grad_wrt],
+        grad_outputs=cotangent, allow_unused=False)
+
+    for key, expected, actual in zip(case.grad_wrt, reference_grads, actual_grads):
+        if actual.shape != expected.shape:
+            raise golden.TensorMismatch(
+                f"{case.name}:live-grad[{key}] shape {tuple(actual.shape)} "
+                f"!= {tuple(expected.shape)}")
+        if actual.dtype != expected.dtype:
+            raise golden.TensorMismatch(
+                f"{case.name}:live-grad[{key}] dtype {actual.dtype} != {expected.dtype}")
+        difference = (actual.float() - expected.float()).abs()
+        worst = float(difference.max()) if difference.numel() else 0.0
+        if worst > tol:
+            raise golden.TensorMismatch(
+                f"{case.name}:live-grad[{key}] max|diff|={worst:.3e} > tol={tol:.3e}")
+
+
+def check_crop_border_gradients(impl, device, forward_tol, grad_tol):
+    """Exercise border-clamp derivative branches, including exact edges."""
+    generator = torch.Generator(device=device).manual_seed(73)
+    base_x = torch.rand(1, 2, 8, 8, generator=generator, device=device)
+    edge = 1.0 - 1.0 / 8.0  # normalized coordinate mapping exactly to pixel 0 / 7
+    base_kp = torch.tensor(
+        [[[-edge, -edge], [edge, edge], [-1.0, 0.0], [1.0, 0.0],
+          [0.0, -1.0], [0.0, 1.0]]], device=device)
+    base_scale = torch.zeros_like(base_kp)  # sigmoid -> 0.5
+
+    ref_x = base_x.detach().clone().requires_grad_(True)
+    ref_kp = base_kp.detach().clone().requires_grad_(True)
+    ref_scale = base_scale.detach().clone().requires_grad_(True)
+    actual_x = base_x.detach().clone().requires_grad_(True)
+    actual_kp = base_kp.detach().clone().requires_grad_(True)
+    actual_scale = base_scale.detach().clone().requires_grad_(True)
+
+    expected = reference.stn_crop(ref_x, ref_kp, 3, z_scale=ref_scale)
+    actual = impl.stn_crop(actual_x, actual_kp, 3, z_scale=actual_scale)
+    forward_difference = (actual - expected).abs()
+    worst_forward = float(forward_difference.max())
+    if worst_forward > forward_tol:
+        raise golden.TensorMismatch(
+            f"crop.border:forward max|diff|={worst_forward:.3e} > tol={forward_tol:.3e}")
+
+    cotangent = torch.rand(expected.shape, generator=generator, device=device)
+    expected_grads = torch.autograd.grad(expected, (ref_x, ref_kp, ref_scale),
+                                         grad_outputs=cotangent)
+    actual_grads = torch.autograd.grad(actual, (actual_x, actual_kp, actual_scale),
+                                       grad_outputs=cotangent)
+    for key, expected_grad, actual_grad in zip(
+            ("x", "kp", "z_scale"), expected_grads, actual_grads):
+        worst = float((actual_grad - expected_grad).abs().max())
+        if worst > grad_tol:
+            raise golden.TensorMismatch(
+                f"crop.border:grad[{key}] max|diff|={worst:.3e} > tol={grad_tol:.3e}")
+
+
+def check_crop_selective_gradients(impl, device, grad_tol):
+    """Compile and verify each conditional backward output independently."""
+    generator = torch.Generator(device=device).manual_seed(97)
+    base_x = torch.rand(1, 2, 8, 8, generator=generator, device=device)
+    base_kp = 1.5 * torch.rand(1, 3, 2, generator=generator, device=device) - 0.75
+    base_scale = 2.0 * torch.rand(1, 3, 2, generator=generator, device=device) - 1.0
+
+    for selected in ("x", "kp", "z_scale"):
+        ref_inputs = {
+            "x": base_x.detach().clone().requires_grad_(selected == "x"),
+            "kp": base_kp.detach().clone().requires_grad_(selected == "kp"),
+            "z_scale": base_scale.detach().clone().requires_grad_(selected == "z_scale"),
+        }
+        actual_inputs = {
+            key: value.detach().clone().requires_grad_(key == selected)
+            for key, value in (("x", base_x), ("kp", base_kp), ("z_scale", base_scale))
+        }
+        expected = reference.stn_crop(ref_inputs["x"], ref_inputs["kp"], 3,
+                                      z_scale=ref_inputs["z_scale"])
+        actual = impl.stn_crop(actual_inputs["x"], actual_inputs["kp"], 3,
+                               z_scale=actual_inputs["z_scale"])
+        cotangent = torch.rand(expected.shape, generator=generator, device=device)
+        expected_grad, = torch.autograd.grad(
+            expected, (ref_inputs[selected],), grad_outputs=cotangent)
+        actual_grad, = torch.autograd.grad(
+            actual, (actual_inputs[selected],), grad_outputs=cotangent)
+        worst = float((actual_grad - expected_grad).abs().max())
+        if worst > grad_tol:
+            raise golden.TensorMismatch(
+                f"crop.selective:grad[{selected}] max|diff|={worst:.3e} > tol={grad_tol:.3e}")
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -309,7 +414,8 @@ def check_gradcheck(impl, device):
 # runner
 # --------------------------------------------------------------------------- #
 def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_tol=None,
-        gradcheck=False, verbose=False, gradient_determinism=True, live_forward=False):
+        gradcheck=False, verbose=False, gradient_determinism=True, live_forward=False,
+        live_gradients=False):
     payload, path = load_fixture(device, scope)
     expected_cases = payload["cases"]
     cases = [c for c in _cases_for(scope) if c.name in expected_cases]
@@ -364,6 +470,21 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_
             for case in accelerated:
                 attempt(f"live forward {case.name}", lambda c=case: check_live_forward(
                     c, lpwm_stn, device, tol))
+
+        if live_gradients:
+            active_impl = lpwm_stn.get_backend()
+            live_cases = cases + (PRIOR_BENCH_CASES if scope == "all" else [])
+            accelerated = [case for case in live_cases if case.needs_grad and
+                           getattr(active_impl, case.op, None) is not None]
+            print(f"\n[live gradients] full tensors vs reference ({len(accelerated)} accelerated cases)")
+            for case in accelerated:
+                attempt(f"live gradients {case.name}", lambda c=case: check_live_gradients(
+                    c, lpwm_stn, device, effective_grad_tol))
+            if getattr(active_impl, "stn_crop", None) is not None:
+                attempt("live gradients crop.border", lambda: check_crop_border_gradients(
+                    lpwm_stn, device, tol, effective_grad_tol))
+                attempt("live gradients crop.selective", lambda: check_crop_selective_gradients(
+                    lpwm_stn, device, effective_grad_tol))
 
         suffix = "" if gradient_determinism else " (gradient rerun skipped explicitly)"
         print(f"\n[determinism] same inputs twice{suffix}")
@@ -445,12 +566,14 @@ def main(argv=None):
                     help="keep forward rerun checks but skip CUDA gradient byte checks")
     ap.add_argument("--live-forward", action="store_true",
                     help="compare every accelerated forward element to a live reference tensor")
+    ap.add_argument("--live-gradients", action="store_true",
+                    help="compare every accelerated input-gradient element to a live reference tensor")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     return run(device=args.device, scope=args.scope, backend=args.backend, tol=args.tol,
                grad_tol=args.grad_tol, gradcheck=args.gradcheck, verbose=args.verbose,
                gradient_determinism=not args.skip_gradient_determinism,
-               live_forward=args.live_forward)
+               live_forward=args.live_forward, live_gradients=args.live_gradients)
 
 
 if __name__ == "__main__":

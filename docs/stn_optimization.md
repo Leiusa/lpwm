@@ -225,4 +225,5 @@ Fixtures are device-specific: CUDA's sampler does not produce CPU's bytes.
 Generate the CUDA fixture from `_baseline` on the target GPU **before** starting
 kernel work, so the kernel is compared against that machine's baseline.
 
-Stage 1 contains no GPU measurements and makes no acceleration claim.
+The immutable Stage 1 tag makes no acceleration claim; the GPU measurements
+above were recorded later on the kernel-development branch against that tag.
