@@ -83,6 +83,29 @@ with an explicit `--tol` and record why — do not relax the default.
 `affine_grid_sample` primitive. The fused paths deliberately retain their
 baseline float32-theta behavior and are covered by the pinned gradient tests.
 
+### CUDA backward caveat
+
+The first RTX 4090 run showed that PyTorch 2.6's CUDA `grid_sample` backward is
+not bit-deterministic for the sampled-input gradient: repeated executions of
+the frozen baseline differed by roughly `1e-7` to `4e-6` on the correctness
+cases. Forward remained bit-exact, coordinate/scale gradients stayed within the
+same numerical envelope, and float64 `gradcheck` passed. This is the documented
+atomic-accumulation behaviour of the CUDA sampler, not an isolation change.
+
+For baseline acceptance on CUDA, keep the forward comparison bit-exact, apply
+an explicit tolerance only to gradients, and skip only the gradient rerun
+assertion:
+
+```bash
+python tests/stn/test_stn.py --device cuda --scope all --grad-tol 1e-5 --skip-gradient-determinism
+```
+
+Forward determinism remains checked by that command. Keep gradient determinism
+enabled when evaluating a custom backend if deterministic backward is one of
+that backend's requirements. The test runner also stores failure messages
+rather than exception objects so failed CUDA cases cannot retain traceback
+tensors and exhaust GPU memory during a sweep.
+
 ## Registering a backend
 
 ```python
@@ -158,6 +181,35 @@ and the mask builders cost about as much as paste despite being `no_grad` and
 `nearest`-mode. Whether that ordering survives on GPU is exactly what the first
 stage-2 measurement should establish.
 
+## Recorded RTX 4090 baseline
+
+RunPod Secure Cloud, NVIDIA GeForce RTX 4090 (SM 8.9), Python 3.10.16,
+torch 2.6.0+cu126, float32. Each time is the median of 10 iterations after 3
+warmups. Memory is PyTorch peak allocated memory with the case inputs live, so
+it represents the capacity needed to execute the isolated call rather than only
+the incremental allocation inside the op.
+
+| case | forward ms | forward+backward ms | forward peak MB | training peak MB |
+|---|---:|---:|---:|---:|
+| `bair/crop.scale` | 2.033 | 7.015 | 1,479.0 | 2,940.8 |
+| `bair/paste.scale` | 23.768 | 103.639 | 2,878.0 | 6,210.7 |
+| `bair/masks.fast` | 22.872 | — | 2,856.0 | — |
+| `bair/masks.scale` | 22.234 | — | 2,384.1 | — |
+| `bair64/crop.scale` | 0.820 | 2.709 | 540.2 | 1,056.4 |
+| `bair64/paste.scale` | 8.512 | 36.739 | 1,034.6 | 2,219.8 |
+| `obj3d128/crop.scale` | 0.646 | 2.516 | 353.3 | 665.9 |
+| `obj3d128/paste.scale` | 4.801 | 20.861 | 606.9 | 1,291.2 |
+| `balls/crop.scale` | 0.130 | 0.550 | 87.4 | 152.5 |
+| `balls/paste.scale` | 1.011 | 4.347 | 140.0 | 282.5 |
+
+The GPU ranking is now measured rather than inferred: paste backward is the
+largest training cost, while paste and both mask builders dominate inference
+time. Paste also has the largest peak allocation. `stn_crop` remains a useful
+first custom kernel because it has the narrowest boundary and eliminating its
+materialized repeat directly removes 1,416 MB in the BAIR retained-particle
+case. After that proof of correctness and backend wiring, paste is the larger
+performance target.
+
 ## Running it
 
 ```bash
@@ -166,6 +218,7 @@ python tests/stn/test_stn.py --scope all           # + full training shapes
 python tests/stn/test_stn.py --gradcheck
 python tests/stn/bench_stn.py --device cuda --scope bench
 python tests/stn/gen_golden.py --device cuda --scope all  # pin on a GPU box
+python tests/stn/test_stn.py --device cuda --scope all --grad-tol 1e-5 --skip-gradient-determinism
 ```
 
 Fixtures are device-specific: CUDA's sampler does not produce CPU's bytes.

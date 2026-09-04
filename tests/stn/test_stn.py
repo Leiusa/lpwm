@@ -76,8 +76,10 @@ def _cases_for(scope):
 # --------------------------------------------------------------------------- #
 # the checks
 # --------------------------------------------------------------------------- #
-def check_case(case, impl, expected, device, tol=0.0):
+def check_case(case, impl, expected, device, tol=0.0, grad_tol=None):
     """Forward + gradients of one case against its pinned record."""
+    if grad_tol is None:
+        grad_tol = tol
     ins = case.inputs(device=device)
     out = case.run(impl, ins)
 
@@ -98,10 +100,10 @@ def check_case(case, impl, expected, device, tol=0.0):
     grads = torch.autograd.grad(out, wrt, grad_outputs=cot, allow_unused=False)
     for key, g in zip(case.grad_wrt, grads):
         label = f"{case.name}:grad[{key}]"
-        if tol == 0.0:
+        if grad_tol == 0.0:
             golden.compare(label, expected["grads"][key], g)
         else:
-            _compare_tol(label, expected["grads"][key], g, tol)
+            _compare_tol(label, expected["grads"][key], g, grad_tol)
 
 
 def _compare_tol(label, expected, actual, tol):
@@ -121,13 +123,13 @@ def _compare_tol(label, expected, actual, tol):
         raise golden.TensorMismatch(f"{label}: max|diff|={worst:.3e} > tol={tol:.3e}")
 
 
-def check_determinism(case, impl, device):
+def check_determinism(case, impl, device, gradients=True):
     """The same inputs must produce the same bytes twice -- a kernel with a
     non-deterministic reduction (atomics into dL/dimage) fails here."""
     ins = case.inputs(device=device)
     first = case.run(impl, ins)
     rec = golden.describe(first)
-    if case.needs_grad:
+    if case.needs_grad and gradients:
         cot = case.cotangent(first)
         g1 = torch.autograd.grad(first, [ins[k] for k in case.grad_wrt], grad_outputs=cot)
         grec = [golden.describe(g)["sha256"] for g in g1]
@@ -135,7 +137,7 @@ def check_determinism(case, impl, device):
     ins2 = case.inputs(device=device)
     second = case.run(impl, ins2)
     golden.compare(f"{case.name}:forward(rerun)", rec, second)
-    if case.needs_grad:
+    if case.needs_grad and gradients:
         cot2 = case.cotangent(second)
         g2 = torch.autograd.grad(second, [ins2[k] for k in case.grad_wrt], grad_outputs=cot2)
         for key, ref_sha, g in zip(case.grad_wrt, grec, g2):
@@ -282,8 +284,8 @@ def check_gradcheck(impl, device):
 # --------------------------------------------------------------------------- #
 # runner
 # --------------------------------------------------------------------------- #
-def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, gradcheck=False,
-        verbose=False):
+def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_tol=None,
+        gradcheck=False, verbose=False, gradient_determinism=True):
     payload, path = load_fixture(device, scope)
     expected_cases = payload["cases"]
     cases = [c for c in _cases_for(scope) if c.name in expected_cases]
@@ -293,8 +295,9 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, gradc
 
     print(f"fixture: {os.path.relpath(path)}  (torch {payload['meta']['torch']}, "
           f"baseline {(payload['meta'].get('git_commit') or '?')[:8]})")
+    effective_grad_tol = tol if grad_tol is None else grad_tol
     print(f"running torch {torch.__version__} on {device}, backend='{backend or lpwm_stn.get_backend_name()}', "
-          f"{len(cases)} cases x {len(impls)} impls, tol={tol}")
+          f"{len(cases)} cases x {len(impls)} impls, tol={tol}, grad_tol={effective_grad_tol}")
     if missing:
         print(f"note: {len(missing)} case(s) not in the fixture, skipped: {', '.join(missing)}")
 
@@ -308,8 +311,12 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, gradc
             skipped.append((label, str(exc)))
             print(f"  SKIP {label}: {exc}")
         except Exception as exc:  # noqa: BLE001 - the runner reports, it does not handle
-            failures.append((label, exc, traceback.format_exc()))
-            print(f"  FAIL {label}: {exc}")
+            # Do not retain the exception object: its traceback keeps this
+            # function's CUDA tensors alive and a sweep of expected failures
+            # can otherwise consume the whole GPU before the next case runs.
+            message = str(exc)
+            failures.append((label, message, traceback.format_exc()))
+            print(f"  FAIL {label}: {message}")
         else:
             if verbose:
                 print(f"  ok   {label}")
@@ -320,11 +327,14 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, gradc
             print(f"\n[{impl_name}] vs baseline")
             for case in cases:
                 attempt(f"{impl_name} {case.name}",
-                        lambda c=case, i=impl: check_case(c, i, expected_cases[c.name], device, tol))
+                        lambda c=case, i=impl: check_case(
+                            c, i, expected_cases[c.name], device, tol, effective_grad_tol))
 
-        print("\n[determinism] same inputs twice")
+        suffix = "" if gradient_determinism else " (gradient rerun skipped explicitly)"
+        print(f"\n[determinism] same inputs twice{suffix}")
         for case in cases:
-            attempt(f"determinism {case.name}", lambda c=case: check_determinism(c, lpwm_stn, device))
+            attempt(f"determinism {case.name}", lambda c=case: check_determinism(
+                c, lpwm_stn, device, gradients=gradient_determinism))
 
         if gradcheck:
             print("\n[gradcheck] float64 affine primitive, microscopic shape")
@@ -392,12 +402,17 @@ def main(argv=None):
     ap.add_argument("--backend", default=None, help="STN backend to exercise (default: the active one)")
     ap.add_argument("--tol", type=float, default=0.0,
                     help="max abs deviation allowed; 0 (default) demands bit-exactness")
+    ap.add_argument("--grad-tol", type=float, default=None,
+                    help="gradient-only max abs deviation (default: use --tol)")
     ap.add_argument("--gradcheck", action="store_true",
                     help="also run float64 autograd.gradcheck on tiny shapes")
+    ap.add_argument("--skip-gradient-determinism", action="store_true",
+                    help="keep forward rerun checks but skip CUDA gradient byte checks")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     return run(device=args.device, scope=args.scope, backend=args.backend, tol=args.tol,
-               gradcheck=args.gradcheck, verbose=args.verbose)
+               grad_tol=args.grad_tol, gradcheck=args.gradcheck, verbose=args.verbose,
+               gradient_determinism=not args.skip_gradient_determinism)
 
 
 if __name__ == "__main__":

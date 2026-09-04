@@ -14,8 +14,10 @@ would defeat its purpose.
 
 import argparse
 import os
+import platform
 import sys
 
+import numpy as np
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -64,12 +66,19 @@ def main(argv=None):
         raise SystemExit(f"{path} already exists; pass --force only if you are deliberately re-pinning the baseline")
 
     torch.manual_seed(0)
+    cuda_device = args.device.startswith("cuda") and torch.cuda.is_available()
     payload = {
         "version": golden.FIXTURE_VERSION,
         "meta": {
             "source": "lpwm_stn._baseline (frozen copy of utils/util_func.py + modules/modules.py @ 4cf53c4)",
             "torch": torch.__version__,
+            "torch_cuda": torch.version.cuda,
+            "cudnn": torch.backends.cudnn.version(),
+            "python": platform.python_version(),
+            "numpy": np.__version__,
             "device": args.device,
+            "device_name": torch.cuda.get_device_name(args.device) if cuda_device else None,
+            "device_capability": torch.cuda.get_device_capability(args.device) if cuda_device else None,
             "dtype": "torch.float32",
             "git_commit": golden.git_commit(),
             "scope": args.scope,

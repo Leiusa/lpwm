@@ -11,7 +11,8 @@ GPU profile before treating results as the full-model baseline.
 Reported per case:
     fwd      forward only, ms
     fwd+bwd  forward plus backward through the case's gradient contract, ms
-    peak     peak allocated bytes during fwd+bwd (CUDA only; CPU reports 0)
+    fwd MB   peak allocated bytes with inputs live during forward
+    train MB peak allocated bytes with inputs live during fwd+bwd
     inflate  for the crop cases, how much larger the ``repeat``-ed input is
              than the image it came from -- the allocation a fused kernel removes
 
@@ -63,7 +64,10 @@ def bench_case(case, device, iters, warmup, backward=True):
             case.run(lpwm_stn, ins)
 
     row = {"case": case.name, "op": case.op}
+    if device.startswith("cuda"):
+        torch.cuda.reset_peak_memory_stats()
     row["fwd_ms"], row["fwd_ms_min"] = _time(forward_only, device, iters, warmup)
+    row["fwd_peak_bytes"] = torch.cuda.max_memory_allocated() if device.startswith("cuda") else 0
 
     if case.needs_grad and backward:
         wrt = [ins[k] for k in case.grad_wrt]
@@ -78,10 +82,12 @@ def bench_case(case, device, iters, warmup, backward=True):
         if device.startswith("cuda"):
             torch.cuda.reset_peak_memory_stats()
         row["fwd_bwd_ms"], row["fwd_bwd_ms_min"] = _time(fwd_bwd, device, iters, warmup)
-        row["peak_bytes"] = torch.cuda.max_memory_allocated() if device.startswith("cuda") else 0
+        row["fwd_bwd_peak_bytes"] = torch.cuda.max_memory_allocated() if device.startswith("cuda") else 0
     else:
         row["fwd_bwd_ms"] = row["fwd_bwd_ms_min"] = float("nan")
-        row["peak_bytes"] = 0
+        row["fwd_bwd_peak_bytes"] = 0
+    # Compatibility for callers written against the original single peak field.
+    row["peak_bytes"] = row["fwd_bwd_peak_bytes"] or row["fwd_peak_bytes"]
 
     if case.op == "stn_crop":
         wl = case.workload
@@ -99,8 +105,8 @@ def run(device="cpu", scope="correctness", iters=10, warmup=3, backend=None, bac
         name = lpwm_stn.get_backend_name()
         print(f"# torch {torch.__version__}  device={device}  backend={name}  "
               f"iters={iters} (median of), warmup={warmup}")
-        print(f"{'case':<26} {'fwd ms':>9} {'fwd+bwd ms':>11} {'peak MB':>9}  notes")
-        print("-" * 78)
+        print(f"{'case':<26} {'fwd ms':>9} {'fwd+bwd ms':>11} {'fwd MB':>9} {'train MB':>9}  notes")
+        print("-" * 89)
         rows = []
         for case in cases:
             row = bench_case(case, device, iters, warmup, backward=backward)
@@ -108,9 +114,10 @@ def run(device="cpu", scope="correctness", iters=10, warmup=3, backend=None, bac
             note = ""
             if "repeat_bytes" in row:
                 note = f"repeat alloc {row['repeat_bytes'] / 1e6:.0f} MB (x{row['inflate']})"
-            peak = row["peak_bytes"] / 1e6
+            fwd_peak = row["fwd_peak_bytes"] / 1e6
+            train_peak = row["fwd_bwd_peak_bytes"] / 1e6
             print(f"{row['case']:<26} {row['fwd_ms']:>9.3f} {row['fwd_bwd_ms']:>11.3f} "
-                  f"{peak:>9.1f}  {note}")
+                  f"{fwd_peak:>9.1f} {train_peak:>9.1f}  {note}")
     return rows
 
 
