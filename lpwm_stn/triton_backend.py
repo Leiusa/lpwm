@@ -1,12 +1,13 @@
 """Triton backend for the isolated LPWM spatial transformer.
 
-The first optimized operation is :func:`stn_crop`.  Its forward kernel reads
-the source image through the original batch index instead of materializing the
-``[batch * n_kp, channels, height, width]`` repeat used by the reference.
+The optimized :func:`stn_crop` reads the source image through the original
+batch index instead of materializing the reference's per-particle repeat.
+The optimized :func:`stn_paste` evaluates the inverse affine map directly
+instead of materializing theta and its full sampling grid.
 
-The custom backward mirrors PyTorch's bilinear border-sampling derivatives:
-one kernel atomically accumulates the shared-image gradient, while a second
-kernel reduces the keypoint and scale gradients per particle.
+The custom backwards mirror PyTorch's bilinear sampling derivatives. Crop
+atomically accumulates the shared-image gradient; paste atomically accumulates
+patch gradients and uses a two-stage per-particle parameter reduction.
 """
 
 import torch
@@ -278,6 +279,291 @@ if triton is not None:
             tl.store(grad_scale_ptr + output_base + 1, grad_scale_x)
 
 
+    @triton.jit
+    def _stn_paste_forward_kernel(
+            patches_ptr, kp_ptr, scale_ptr, base_axis_ptr, out_ptr, n_elements,
+            stride_pb, stride_pk, stride_pc, stride_ph, stride_pw,
+            stride_kpb, stride_kpk, stride_kpd,
+            stride_sb, stride_sk, stride_sd,
+            N_KP: tl.constexpr, CHANNELS: tl.constexpr,
+            PATCH: tl.constexpr, IMAGE: tl.constexpr,
+            BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        active = offsets < n_elements
+
+        canvas_x = offsets % IMAGE
+        quotient = offsets // IMAGE
+        canvas_y = quotient % IMAGE
+        quotient = quotient // IMAGE
+        channel = quotient % CHANNELS
+        particle_row = quotient // CHANNELS
+        batch = particle_row // N_KP
+        particle = particle_row % N_KP
+
+        kp_base = batch * stride_kpb + particle * stride_kpk
+        pos_y = tl.load(kp_ptr + kp_base, mask=active, other=0.0).to(tl.float32)
+        pos_x = tl.load(kp_ptr + kp_base + stride_kpd, mask=active, other=0.0).to(tl.float32)
+        scale_base = batch * stride_sb + particle * stride_sk
+        scale_y = tl.load(scale_ptr + scale_base, mask=active, other=1.0).to(tl.float32)
+        scale_x = tl.load(scale_ptr + scale_base + stride_sd, mask=active, other=1.0).to(tl.float32)
+
+        # Match spatial_transform(inverse=True): scale and translation are two
+        # separately rounded divisions before affine_grid applies the matrix.
+        denominator_y = scale_y + 1.0e-9
+        denominator_x = scale_x + 1.0e-9
+        inv_y = 1.0 / denominator_y
+        inv_x = 1.0 / denominator_x
+        translate_y = -pos_y / denominator_y
+        translate_x = -pos_x / denominator_x
+        base_x = tl.load(base_axis_ptr + canvas_x, mask=active, other=0.0)
+        base_y = tl.load(base_axis_ptr + canvas_y, mask=active, other=0.0)
+        norm_x = base_x * inv_x + translate_x
+        norm_y = base_y * inv_y + translate_y
+        patch_x = ((norm_x + 1.0) * PATCH - 1.0) * 0.5
+        patch_y = ((norm_y + 1.0) * PATCH - 1.0) * 0.5
+
+        x0_float = tl.floor(patch_x)
+        y0_float = tl.floor(patch_y)
+        x0 = x0_float.to(tl.int32)
+        y0 = y0_float.to(tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        dx = patch_x - x0_float
+        dy = patch_y - y0_float
+
+        patch_base = (batch * stride_pb + particle * stride_pk +
+                      channel * stride_pc)
+        valid_x0 = (x0 >= 0) & (x0 < PATCH)
+        valid_x1 = (x1 >= 0) & (x1 < PATCH)
+        valid_y0 = (y0 >= 0) & (y0 < PATCH)
+        valid_y1 = (y1 >= 0) & (y1 < PATCH)
+        v00 = tl.load(patches_ptr + patch_base + y0 * stride_ph + x0 * stride_pw,
+                      mask=active & valid_x0 & valid_y0, other=0.0).to(tl.float32)
+        v01 = tl.load(patches_ptr + patch_base + y0 * stride_ph + x1 * stride_pw,
+                      mask=active & valid_x1 & valid_y0, other=0.0).to(tl.float32)
+        v10 = tl.load(patches_ptr + patch_base + y1 * stride_ph + x0 * stride_pw,
+                      mask=active & valid_x0 & valid_y1, other=0.0).to(tl.float32)
+        v11 = tl.load(patches_ptr + patch_base + y1 * stride_ph + x1 * stride_pw,
+                      mask=active & valid_x1 & valid_y1, other=0.0).to(tl.float32)
+
+        value = v00 * (1.0 - dx) * (1.0 - dy)
+        value += v01 * dx * (1.0 - dy)
+        value += v10 * (1.0 - dx) * dy
+        value += v11 * dx * dy
+        tl.store(out_ptr + offsets, value, mask=active)
+
+
+    @triton.jit
+    def _stn_paste_grad_patches_kernel(
+            grad_out_ptr, kp_ptr, scale_ptr, base_axis_ptr,
+            grad_patches_ptr, n_elements,
+            stride_gob, stride_gok, stride_goc, stride_goh, stride_gow,
+            stride_kpb, stride_kpk, stride_kpd,
+            stride_sb, stride_sk, stride_sd,
+            stride_gpb, stride_gpk, stride_gpc, stride_gph, stride_gpw,
+            N_KP: tl.constexpr, CHANNELS: tl.constexpr,
+            PATCH: tl.constexpr, IMAGE: tl.constexpr,
+            BLOCK: tl.constexpr):
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        active = offsets < n_elements
+
+        canvas_x = offsets % IMAGE
+        quotient = offsets // IMAGE
+        canvas_y = quotient % IMAGE
+        quotient = quotient // IMAGE
+        channel = quotient % CHANNELS
+        particle_row = quotient // CHANNELS
+        batch = particle_row // N_KP
+        particle = particle_row % N_KP
+
+        kp_base = batch * stride_kpb + particle * stride_kpk
+        pos_y = tl.load(kp_ptr + kp_base, mask=active, other=0.0).to(tl.float32)
+        pos_x = tl.load(kp_ptr + kp_base + stride_kpd, mask=active, other=0.0).to(tl.float32)
+        scale_base = batch * stride_sb + particle * stride_sk
+        scale_y = tl.load(scale_ptr + scale_base, mask=active, other=1.0).to(tl.float32)
+        scale_x = tl.load(scale_ptr + scale_base + stride_sd, mask=active, other=1.0).to(tl.float32)
+        denominator_y = scale_y + 1.0e-9
+        denominator_x = scale_x + 1.0e-9
+        inv_y = 1.0 / denominator_y
+        inv_x = 1.0 / denominator_x
+        translate_y = -pos_y / denominator_y
+        translate_x = -pos_x / denominator_x
+        base_x = tl.load(base_axis_ptr + canvas_x, mask=active, other=0.0)
+        base_y = tl.load(base_axis_ptr + canvas_y, mask=active, other=0.0)
+        norm_x = base_x * inv_x + translate_x
+        norm_y = base_y * inv_y + translate_y
+        patch_x = ((norm_x + 1.0) * PATCH - 1.0) * 0.5
+        patch_y = ((norm_y + 1.0) * PATCH - 1.0) * 0.5
+
+        x0_float = tl.floor(patch_x)
+        y0_float = tl.floor(patch_y)
+        x0 = x0_float.to(tl.int32)
+        y0 = y0_float.to(tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        dx = patch_x - x0_float
+        dy = patch_y - y0_float
+
+        grad_offset = (batch * stride_gob + particle * stride_gok +
+                       channel * stride_goc + canvas_y * stride_goh +
+                       canvas_x * stride_gow)
+        grad = tl.load(grad_out_ptr + grad_offset, mask=active, other=0.0).to(tl.float32)
+        patch_base = (batch * stride_gpb + particle * stride_gpk +
+                      channel * stride_gpc)
+        valid_x0 = (x0 >= 0) & (x0 < PATCH)
+        valid_x1 = (x1 >= 0) & (x1 < PATCH)
+        valid_y0 = (y0 >= 0) & (y0 < PATCH)
+        valid_y1 = (y1 >= 0) & (y1 < PATCH)
+        tl.atomic_add(
+            grad_patches_ptr + patch_base + y0 * stride_gph + x0 * stride_gpw,
+            grad * (1.0 - dx) * (1.0 - dy),
+            mask=active & valid_x0 & valid_y0)
+        tl.atomic_add(
+            grad_patches_ptr + patch_base + y0 * stride_gph + x1 * stride_gpw,
+            grad * dx * (1.0 - dy),
+            mask=active & valid_x1 & valid_y0)
+        tl.atomic_add(
+            grad_patches_ptr + patch_base + y1 * stride_gph + x0 * stride_gpw,
+            grad * (1.0 - dx) * dy,
+            mask=active & valid_x0 & valid_y1)
+        tl.atomic_add(
+            grad_patches_ptr + patch_base + y1 * stride_gph + x1 * stride_gpw,
+            grad * dx * dy,
+            mask=active & valid_x1 & valid_y1)
+
+
+    @triton.jit
+    def _stn_paste_grad_params_kernel(
+            grad_out_ptr, patches_ptr, kp_ptr, scale_ptr, base_axis_ptr,
+            partials_ptr,
+            stride_gob, stride_gok, stride_goc, stride_goh, stride_gow,
+            stride_pb, stride_pk, stride_pc, stride_ph, stride_pw,
+            stride_kpb, stride_kpk, stride_kpd,
+            stride_sb, stride_sk, stride_sd,
+            N_TILES: tl.constexpr, N_KP: tl.constexpr, CHANNELS: tl.constexpr,
+            PATCH: tl.constexpr, IMAGE: tl.constexpr,
+            BLOCK: tl.constexpr):
+        program = tl.program_id(0)
+        particle_row = program // N_TILES
+        tile = program % N_TILES
+        offsets = tile * BLOCK + tl.arange(0, BLOCK)
+        active = offsets < IMAGE * IMAGE
+        canvas_x = offsets % IMAGE
+        canvas_y = offsets // IMAGE
+        batch = particle_row // N_KP
+        particle = particle_row % N_KP
+
+        kp_base = batch * stride_kpb + particle * stride_kpk
+        pos_y = tl.load(kp_ptr + kp_base).to(tl.float32)
+        pos_x = tl.load(kp_ptr + kp_base + stride_kpd).to(tl.float32)
+        scale_base = batch * stride_sb + particle * stride_sk
+        scale_y = tl.load(scale_ptr + scale_base).to(tl.float32)
+        scale_x = tl.load(scale_ptr + scale_base + stride_sd).to(tl.float32)
+        denominator_y = scale_y + 1.0e-9
+        denominator_x = scale_x + 1.0e-9
+        inv_y = 1.0 / denominator_y
+        inv_x = 1.0 / denominator_x
+        translate_y = -pos_y / denominator_y
+        translate_x = -pos_x / denominator_x
+        base_x = tl.load(base_axis_ptr + canvas_x, mask=active, other=0.0)
+        base_y = tl.load(base_axis_ptr + canvas_y, mask=active, other=0.0)
+        norm_x = base_x * inv_x + translate_x
+        norm_y = base_y * inv_y + translate_y
+        patch_x = ((norm_x + 1.0) * PATCH - 1.0) * 0.5
+        patch_y = ((norm_y + 1.0) * PATCH - 1.0) * 0.5
+
+        x0_float = tl.floor(patch_x)
+        y0_float = tl.floor(patch_y)
+        x0 = x0_float.to(tl.int32)
+        y0 = y0_float.to(tl.int32)
+        x1 = x0 + 1
+        y1 = y0 + 1
+        dx = patch_x - x0_float
+        dy = patch_y - y0_float
+        valid_x0 = (x0 >= 0) & (x0 < PATCH)
+        valid_x1 = (x1 >= 0) & (x1 < PATCH)
+        valid_y0 = (y0 >= 0) & (y0 < PATCH)
+        valid_y1 = (y1 >= 0) & (y1 < PATCH)
+
+        grad_patch_x = tl.zeros((BLOCK,), dtype=tl.float32)
+        grad_patch_y = tl.zeros((BLOCK,), dtype=tl.float32)
+        for channel in range(CHANNELS):
+            patch_base = (batch * stride_pb + particle * stride_pk +
+                          channel * stride_pc)
+            v00 = tl.load(patches_ptr + patch_base + y0 * stride_ph + x0 * stride_pw,
+                          mask=active & valid_x0 & valid_y0, other=0.0).to(tl.float32)
+            v01 = tl.load(patches_ptr + patch_base + y0 * stride_ph + x1 * stride_pw,
+                          mask=active & valid_x1 & valid_y0, other=0.0).to(tl.float32)
+            v10 = tl.load(patches_ptr + patch_base + y1 * stride_ph + x0 * stride_pw,
+                          mask=active & valid_x0 & valid_y1, other=0.0).to(tl.float32)
+            v11 = tl.load(patches_ptr + patch_base + y1 * stride_ph + x1 * stride_pw,
+                          mask=active & valid_x1 & valid_y1, other=0.0).to(tl.float32)
+            grad_offset = (batch * stride_gob + particle * stride_gok +
+                           channel * stride_goc + canvas_y * stride_goh +
+                           canvas_x * stride_gow)
+            grad = tl.load(grad_out_ptr + grad_offset, mask=active, other=0.0).to(tl.float32)
+
+            grad_patch_x -= v00 * (1.0 - dy) * grad
+            grad_patch_y -= v00 * (1.0 - dx) * grad
+            grad_patch_x += v01 * (1.0 - dy) * grad
+            grad_patch_y -= v01 * dx * grad
+            grad_patch_x -= v10 * dy * grad
+            grad_patch_y += v10 * (1.0 - dx) * grad
+            grad_patch_x += v11 * dy * grad
+            grad_patch_y += v11 * dx * grad
+
+        grad_norm_x = grad_patch_x * (PATCH * 0.5)
+        grad_norm_y = grad_patch_y * (PATCH * 0.5)
+        grad_pos_x = tl.sum(-grad_norm_x * inv_x, axis=0)
+        grad_pos_y = tl.sum(-grad_norm_y * inv_y, axis=0)
+        grad_scale_x = tl.sum(
+            grad_norm_x * (pos_x - base_x) * inv_x * inv_x, axis=0)
+        grad_scale_y = tl.sum(
+            grad_norm_y * (pos_y - base_y) * inv_y * inv_y, axis=0)
+
+        partial_base = (particle_row * N_TILES + tile) * 4
+        tl.store(partials_ptr + partial_base, grad_pos_y)
+        tl.store(partials_ptr + partial_base + 1, grad_pos_x)
+        tl.store(partials_ptr + partial_base + 2, grad_scale_y)
+        tl.store(partials_ptr + partial_base + 3, grad_scale_x)
+
+
+    @triton.jit
+    def _stn_paste_reduce_params_kernel(
+            partials_ptr, scale_ptr, grad_kp_ptr, grad_scale_ptr,
+            stride_sb, stride_sk, stride_sd,
+            N_TILES: tl.constexpr, N_KP: tl.constexpr, HAS_SCALE: tl.constexpr,
+            SCALE_NORMALIZED: tl.constexpr, NEED_KP: tl.constexpr,
+            NEED_SCALE: tl.constexpr, BLOCK: tl.constexpr):
+        particle_row = tl.program_id(0)
+        tiles = tl.arange(0, BLOCK)
+        active = tiles < N_TILES
+        partial_base = (particle_row * N_TILES + tiles) * 4
+
+        if NEED_KP:
+            grad_pos_y = tl.sum(
+                tl.load(partials_ptr + partial_base, mask=active, other=0.0), axis=0)
+            grad_pos_x = tl.sum(
+                tl.load(partials_ptr + partial_base + 1, mask=active, other=0.0), axis=0)
+            tl.store(grad_kp_ptr + particle_row * 2, grad_pos_y)
+            tl.store(grad_kp_ptr + particle_row * 2 + 1, grad_pos_x)
+        if NEED_SCALE:
+            grad_scale_y = tl.sum(
+                tl.load(partials_ptr + partial_base + 2, mask=active, other=0.0), axis=0)
+            grad_scale_x = tl.sum(
+                tl.load(partials_ptr + partial_base + 3, mask=active, other=0.0), axis=0)
+            if HAS_SCALE and not SCALE_NORMALIZED:
+                batch = particle_row // N_KP
+                particle = particle_row % N_KP
+                scale_base = batch * stride_sb + particle * stride_sk
+                scale_y = tl.load(scale_ptr + scale_base).to(tl.float32)
+                scale_x = tl.load(scale_ptr + scale_base + stride_sd).to(tl.float32)
+                grad_scale_y *= scale_y * (1.0 - scale_y)
+                grad_scale_x *= scale_x * (1.0 - scale_x)
+            tl.store(grad_scale_ptr + particle_row * 2, grad_scale_y)
+            tl.store(grad_scale_ptr + particle_row * 2 + 1, grad_scale_x)
+
+
 def _can_use_triton(x, kp, z_scale, patch_size, padding_mode):
     return (triton is not None and x.is_cuda and kp.is_cuda and
             (z_scale is None or z_scale.is_cuda) and
@@ -287,8 +573,22 @@ def _can_use_triton(x, kp, z_scale, patch_size, padding_mode):
             padding_mode == "border" and x.ndim == 4 and kp.ndim == 3 and
             kp.shape[0] == x.shape[0] and kp.shape[-1] == 2 and
             (z_scale is None or z_scale.shape == kp.shape) and
-            x.shape[-2] > 0 and x.shape[-1] > 0 and patch_size > 0 and
-            x.shape[1] * patch_size * patch_size <= 65536)
+            x.shape[0] > 0 and kp.shape[1] > 0 and
+            0 < x.shape[1] <= 16 and x.shape[-2] > 0 and x.shape[-1] > 0 and
+            patch_size > 0 and patch_size * patch_size <= 65536)
+
+
+def _can_use_triton_paste(kp, patches, scale, img_size):
+    return (triton is not None and kp.is_cuda and patches.is_cuda and
+            (scale is None or scale.is_cuda) and kp.device == patches.device and
+            (scale is None or kp.device == scale.device) and
+            kp.dtype == torch.float32 and patches.dtype == torch.float32 and
+            (scale is None or scale.dtype == torch.float32) and
+            kp.ndim == 3 and patches.ndim == 5 and kp.shape[-1] == 2 and
+            patches.shape[:2] == kp.shape[:2] and patches.shape[-2] == patches.shape[-1] and
+            (scale is None or scale.shape == kp.shape) and
+            patches.shape[0] > 0 and kp.shape[1] > 0 and
+            0 < patches.shape[2] <= 16 and patches.shape[-1] > 0 and img_size > 0)
 
 
 _BASE_AXES = {}
@@ -378,6 +678,91 @@ def _launch_crop_backward(grad_output, x, kp, normalized_scale, patch_size,
     return grad_x, grad_kp, grad_scale
 
 
+def _launch_paste_forward(kp, patches, normalized_scale, img_size):
+    batch_size, n_kp, channels, patch_size, _ = patches.shape
+    out = torch.empty(
+        (batch_size, n_kp, channels, img_size, img_size),
+        device=patches.device,
+        dtype=patches.dtype,
+    )
+    block = 256
+    grid = (triton.cdiv(out.numel(), block),)
+    _stn_paste_forward_kernel[grid](
+        patches, kp, normalized_scale, _base_axis(patches.device, img_size),
+        out, out.numel(),
+        patches.stride(0), patches.stride(1), patches.stride(2),
+        patches.stride(3), patches.stride(4),
+        kp.stride(0), kp.stride(1), kp.stride(2),
+        normalized_scale.stride(0), normalized_scale.stride(1),
+        normalized_scale.stride(2),
+        N_KP=n_kp, CHANNELS=channels, PATCH=patch_size, IMAGE=img_size,
+        BLOCK=block,
+    )
+    return out
+
+
+def _launch_paste_backward(grad_output, kp, patches, normalized_scale, img_size,
+                           has_scale, scale_normalized,
+                           need_kp, need_patches, need_scale):
+    batch_size, n_kp, channels, patch_size, _ = patches.shape
+    grad_output = grad_output.contiguous()
+    base_axis = _base_axis(patches.device, img_size)
+
+    grad_patches = None
+    if need_patches:
+        grad_patches = torch.zeros_like(patches)
+        block = 256
+        grid = (triton.cdiv(grad_output.numel(), block),)
+        _stn_paste_grad_patches_kernel[grid](
+            grad_output, kp, normalized_scale, base_axis,
+            grad_patches, grad_output.numel(),
+            grad_output.stride(0), grad_output.stride(1),
+            grad_output.stride(2), grad_output.stride(3), grad_output.stride(4),
+            kp.stride(0), kp.stride(1), kp.stride(2),
+            normalized_scale.stride(0), normalized_scale.stride(1),
+            normalized_scale.stride(2),
+            grad_patches.stride(0), grad_patches.stride(1),
+            grad_patches.stride(2), grad_patches.stride(3), grad_patches.stride(4),
+            N_KP=n_kp, CHANNELS=channels, PATCH=patch_size, IMAGE=img_size,
+            BLOCK=block,
+        )
+
+    grad_kp = torch.zeros_like(kp, memory_format=torch.contiguous_format) if need_kp else None
+    grad_scale = (torch.zeros_like(kp, memory_format=torch.contiguous_format)
+                  if need_scale else None)
+    if need_kp or need_scale:
+        block = 256
+        n_tiles = triton.cdiv(img_size * img_size, block)
+        partials = torch.empty(
+            (batch_size * n_kp, n_tiles, 4), device=patches.device, dtype=torch.float32)
+        grid = (batch_size * n_kp * n_tiles,)
+        _stn_paste_grad_params_kernel[grid](
+            grad_output, patches, kp, normalized_scale, base_axis,
+            partials,
+            grad_output.stride(0), grad_output.stride(1),
+            grad_output.stride(2), grad_output.stride(3), grad_output.stride(4),
+            patches.stride(0), patches.stride(1), patches.stride(2),
+            patches.stride(3), patches.stride(4),
+            kp.stride(0), kp.stride(1), kp.stride(2),
+            normalized_scale.stride(0), normalized_scale.stride(1),
+            normalized_scale.stride(2),
+            N_TILES=n_tiles, N_KP=n_kp, CHANNELS=channels,
+            PATCH=patch_size, IMAGE=img_size, BLOCK=block,
+        )
+        reduction_block = triton.next_power_of_2(n_tiles)
+        _stn_paste_reduce_params_kernel[(batch_size * n_kp,)](
+            partials, normalized_scale,
+            grad_kp if grad_kp is not None else kp,
+            grad_scale if grad_scale is not None else kp,
+            normalized_scale.stride(0), normalized_scale.stride(1),
+            normalized_scale.stride(2),
+            N_TILES=n_tiles, N_KP=n_kp, HAS_SCALE=has_scale,
+            SCALE_NORMALIZED=scale_normalized, NEED_KP=need_kp,
+            NEED_SCALE=need_scale, BLOCK=reduction_block,
+        )
+    return grad_kp, grad_patches, grad_scale
+
+
 class _StnCrop(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, kp, z_scale, patch_size, padding_mode):
@@ -401,6 +786,32 @@ class _StnCrop(torch.autograd.Function):
         return grad_x, grad_kp, grad_scale, None, None
 
 
+class _StnPaste(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, kp, patches, scale, img_size, scale_normalized):
+        ctx.img_size = img_size
+        ctx.has_scale = scale is not None
+        ctx.scale_normalized = scale_normalized
+        if scale is None:
+            normalized_scale = (patches.shape[-1] / img_size) * torch.ones_like(kp)
+        elif scale_normalized:
+            normalized_scale = scale
+        else:
+            normalized_scale = torch.sigmoid(scale)
+        ctx.save_for_backward(kp, patches, normalized_scale)
+        return _launch_paste_forward(kp, patches, normalized_scale, img_size)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        kp, patches, normalized_scale = ctx.saved_tensors
+        need_kp, need_patches, need_scale = ctx.needs_input_grad[:3]
+        grad_kp, grad_patches, grad_scale = _launch_paste_backward(
+            grad_output, kp, patches, normalized_scale, ctx.img_size,
+            ctx.has_scale, ctx.scale_normalized,
+            need_kp, need_patches, need_scale)
+        return grad_kp, grad_patches, grad_scale, None, None
+
+
 def stn_crop(x, kp, patch_size, z_scale=None, padding_mode="border"):
     """Fused crop forward and backward for the supported CUDA fp32 path."""
     if triton is None and x.is_cuda:
@@ -412,3 +823,19 @@ def stn_crop(x, kp, patch_size, z_scale=None, padding_mode="border"):
         return reference.stn_crop(
             x, kp, patch_size, z_scale=z_scale, padding_mode=padding_mode)
     return _StnCrop.apply(x, kp, z_scale, int(patch_size), padding_mode)
+
+
+def stn_paste(kp_batch, patches_batch, img_size, scale=None, translation=None,
+              scale_normalized=False):
+    """Fused inverse-transform paste forward/backward for CUDA fp32."""
+    if triton is None and patches_batch.is_cuda:
+        raise RuntimeError(
+            "the Triton STN backend was selected for a CUDA tensor, but Triton "
+            f"could not be imported: {_TRITON_IMPORT_ERROR}"
+        ) from _TRITON_IMPORT_ERROR
+    if not _can_use_triton_paste(kp_batch, patches_batch, scale, img_size):
+        return reference.stn_paste(
+            kp_batch, patches_batch, img_size, scale=scale, translation=translation,
+            scale_normalized=scale_normalized)
+    return _StnPaste.apply(
+        kp_batch, patches_batch, scale, int(img_size), bool(scale_normalized))

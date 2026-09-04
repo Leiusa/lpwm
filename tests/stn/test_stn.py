@@ -274,6 +274,47 @@ def check_crop_selective_gradients(impl, device, grad_tol):
                 f"crop.selective:grad[{selected}] max|diff|={worst:.3e} > tol={grad_tol:.3e}")
 
 
+def check_paste_contract_variants(impl, device, forward_tol, grad_tol):
+    """Cover normalized scale and each conditional paste gradient output."""
+    generator = torch.Generator(device=device).manual_seed(101)
+    base_kp = 1.5 * torch.rand(1, 3, 2, generator=generator, device=device) - 0.75
+    base_patches = torch.rand(1, 3, 2, 3, 3, generator=generator, device=device)
+    base_scale = 0.2 + 0.6 * torch.rand(1, 3, 2, generator=generator, device=device)
+
+    for selected in ("kp_batch", "patches_batch", "scale"):
+        ref_inputs = {
+            "kp_batch": base_kp.detach().clone().requires_grad_(selected == "kp_batch"),
+            "patches_batch": base_patches.detach().clone().requires_grad_(selected == "patches_batch"),
+            "scale": base_scale.detach().clone().requires_grad_(selected == "scale"),
+        }
+        actual_inputs = {
+            key: value.detach().clone().requires_grad_(key == selected)
+            for key, value in (("kp_batch", base_kp),
+                               ("patches_batch", base_patches), ("scale", base_scale))
+        }
+        expected = reference.stn_paste(
+            ref_inputs["kp_batch"], ref_inputs["patches_batch"], 8,
+            scale=ref_inputs["scale"], translation=torch.ones_like(ref_inputs["kp_batch"]),
+            scale_normalized=True)
+        actual = impl.stn_paste(
+            actual_inputs["kp_batch"], actual_inputs["patches_batch"], 8,
+            scale=actual_inputs["scale"], translation=torch.ones_like(actual_inputs["kp_batch"]),
+            scale_normalized=True)
+        worst_forward = float((actual - expected).abs().max())
+        if worst_forward > forward_tol:
+            raise golden.TensorMismatch(
+                f"paste.normalized:forward max|diff|={worst_forward:.3e} > tol={forward_tol:.3e}")
+        cotangent = torch.rand(expected.shape, generator=generator, device=device)
+        expected_grad, = torch.autograd.grad(
+            expected, (ref_inputs[selected],), grad_outputs=cotangent)
+        actual_grad, = torch.autograd.grad(
+            actual, (actual_inputs[selected],), grad_outputs=cotangent)
+        worst = float((actual_grad - expected_grad).abs().max())
+        if worst > grad_tol:
+            raise golden.TensorMismatch(
+                f"paste.normalized:grad[{selected}] max|diff|={worst:.3e} > tol={grad_tol:.3e}")
+
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 #: files that make up the model; none of them may sample a grid on their own
@@ -415,7 +456,7 @@ def check_gradcheck(impl, device):
 # --------------------------------------------------------------------------- #
 def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_tol=None,
         gradcheck=False, verbose=False, gradient_determinism=True, live_forward=False,
-        live_gradients=False):
+        live_gradients=False, crop_grad_tol=None, paste_grad_tol=None):
     payload, path = load_fixture(device, scope)
     expected_cases = payload["cases"]
     cases = [c for c in _cases_for(scope) if c.name in expected_cases]
@@ -427,8 +468,15 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_
     print(f"fixture: {os.path.relpath(path)}  (torch {payload['meta']['torch']}, "
           f"baseline {(payload['meta'].get('git_commit') or '?')[:8]})")
     effective_grad_tol = tol if grad_tol is None else grad_tol
+    op_grad_tols = {
+        "stn_crop": effective_grad_tol if crop_grad_tol is None else crop_grad_tol,
+        "stn_paste": effective_grad_tol if paste_grad_tol is None else paste_grad_tol,
+    }
     print(f"running torch {torch.__version__} on {device}, backend='{backend or lpwm_stn.get_backend_name()}', "
           f"{len(cases)} cases x {len(impls)} impls, tol={tol}, grad_tol={effective_grad_tol}")
+    if crop_grad_tol is not None or paste_grad_tol is not None:
+        print("operator gradient tolerances: " + ", ".join(
+            f"{op}={value}" for op, value in op_grad_tols.items()))
     if missing:
         print(f"note: {len(missing)} case(s) not in the fixture, skipped: {', '.join(missing)}")
 
@@ -457,9 +505,11 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_
         for impl_name, impl, forward_tol in impls:
             print(f"\n[{impl_name}] vs baseline")
             for case in cases:
+                case_grad_tol = (effective_grad_tol if impl is reference else
+                                 op_grad_tols.get(case.op, effective_grad_tol))
                 attempt(f"{impl_name} {case.name}",
-                        lambda c=case, i=impl: check_case(
-                            c, i, expected_cases[c.name], device, forward_tol, effective_grad_tol))
+                        lambda c=case, i=impl, gt=case_grad_tol: check_case(
+                            c, i, expected_cases[c.name], device, forward_tol, gt))
 
         if live_forward:
             active_impl = lpwm_stn.get_backend()
@@ -479,12 +529,15 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_
             print(f"\n[live gradients] full tensors vs reference ({len(accelerated)} accelerated cases)")
             for case in accelerated:
                 attempt(f"live gradients {case.name}", lambda c=case: check_live_gradients(
-                    c, lpwm_stn, device, effective_grad_tol))
+                    c, lpwm_stn, device, op_grad_tols.get(c.op, effective_grad_tol)))
             if getattr(active_impl, "stn_crop", None) is not None:
                 attempt("live gradients crop.border", lambda: check_crop_border_gradients(
-                    lpwm_stn, device, tol, effective_grad_tol))
+                    lpwm_stn, device, tol, op_grad_tols["stn_crop"]))
                 attempt("live gradients crop.selective", lambda: check_crop_selective_gradients(
-                    lpwm_stn, device, effective_grad_tol))
+                    lpwm_stn, device, op_grad_tols["stn_crop"]))
+            if getattr(active_impl, "stn_paste", None) is not None:
+                attempt("live gradients paste.variants", lambda: check_paste_contract_variants(
+                    lpwm_stn, device, tol, op_grad_tols["stn_paste"]))
 
         suffix = "" if gradient_determinism else " (gradient rerun skipped explicitly)"
         print(f"\n[determinism] same inputs twice{suffix}")
@@ -560,6 +613,10 @@ def main(argv=None):
                     help="max abs deviation allowed; 0 (default) demands bit-exactness")
     ap.add_argument("--grad-tol", type=float, default=None,
                     help="gradient-only max abs deviation (default: use --tol)")
+    ap.add_argument("--crop-grad-tol", type=float, default=None,
+                    help="override gradient tolerance for stn_crop")
+    ap.add_argument("--paste-grad-tol", type=float, default=None,
+                    help="override gradient tolerance for stn_paste")
     ap.add_argument("--gradcheck", action="store_true",
                     help="also run float64 autograd.gradcheck on tiny shapes")
     ap.add_argument("--skip-gradient-determinism", action="store_true",
@@ -573,7 +630,8 @@ def main(argv=None):
     return run(device=args.device, scope=args.scope, backend=args.backend, tol=args.tol,
                grad_tol=args.grad_tol, gradcheck=args.gradcheck, verbose=args.verbose,
                gradient_determinism=not args.skip_gradient_determinism,
-               live_forward=args.live_forward, live_gradients=args.live_gradients)
+               live_forward=args.live_forward, live_gradients=args.live_gradients,
+               crop_grad_tol=args.crop_grad_tol, paste_grad_tol=args.paste_grad_tol)
 
 
 if __name__ == "__main__":

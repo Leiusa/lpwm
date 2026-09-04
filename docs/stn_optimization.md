@@ -227,3 +227,6 @@ kernel work, so the kernel is compared against that machine's baseline.
 
 The immutable Stage 1 tag makes no acceleration claim; the GPU measurements
 above were recorded later on the kernel-development branch against that tag.
+The implementation and validation reports are in
+[`stn_triton_crop.md`](stn_triton_crop.md) and
+[`stn_triton_paste.md`](stn_triton_paste.md).

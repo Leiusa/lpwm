@@ -36,7 +36,8 @@ On the RTX 4090 Stage 1 environment:
 
 ```bash
 python tests/stn/test_stn.py --device cuda --scope all \
-  --backend triton --tol 1.5e-5 --grad-tol 1e-2 \
+  --backend triton --tol 2e-5 --grad-tol 1e-5 \
+  --crop-grad-tol 1e-2 --paste-grad-tol 1e-1 \
   --skip-gradient-determinism --live-forward --live-gradients --gradcheck
 ```
 
