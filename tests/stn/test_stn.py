@@ -46,7 +46,7 @@ import lpwm_stn
 from lpwm_stn import reference
 from tests.stn import golden
 from tests.stn.gen_golden import fixture_path
-from tests.stn.stn_cases import BENCH_CASES, CORRECTNESS_CASES
+from tests.stn.stn_cases import BENCH_CASES, CORRECTNESS_CASES, PRIOR_BENCH_CASES
 
 DEFAULT_DEVICE = "cpu"
 
@@ -143,6 +143,30 @@ def check_determinism(case, impl, device, gradients=True):
         for key, ref_sha, g in zip(case.grad_wrt, grec, g2):
             if golden.describe(g)["sha256"] != ref_sha:
                 raise golden.TensorMismatch(f"{case.name}:grad[{key}] is not deterministic across runs")
+
+
+def check_live_forward(case, impl, device, tol):
+    """Compare every forward element to a live reference tensor.
+
+    Large golden records intentionally store hashes and summaries rather than
+    full tensors. This opt-in check is the stronger validation for a custom
+    kernel that legitimately needs a nonzero tolerance.
+    """
+    ins = case.inputs(device=device, requires_grad=False)
+    with torch.no_grad():
+        expected = case.run(reference, ins)
+        actual = case.run(impl, ins)
+    if tuple(actual.shape) != tuple(expected.shape):
+        raise golden.TensorMismatch(
+            f"{case.name}:live-forward shape {tuple(actual.shape)} != {tuple(expected.shape)}")
+    if actual.dtype != expected.dtype:
+        raise golden.TensorMismatch(
+            f"{case.name}:live-forward dtype {actual.dtype} != {expected.dtype}")
+    diff = (actual.float() - expected.float()).abs()
+    worst = float(diff.max()) if diff.numel() else 0.0
+    if worst > tol:
+        raise golden.TensorMismatch(
+            f"{case.name}:live-forward max|diff|={worst:.3e} > tol={tol:.3e}")
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -285,13 +309,14 @@ def check_gradcheck(impl, device):
 # runner
 # --------------------------------------------------------------------------- #
 def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_tol=None,
-        gradcheck=False, verbose=False, gradient_determinism=True):
+        gradcheck=False, verbose=False, gradient_determinism=True, live_forward=False):
     payload, path = load_fixture(device, scope)
     expected_cases = payload["cases"]
     cases = [c for c in _cases_for(scope) if c.name in expected_cases]
     missing = sorted({c.name for c in _cases_for(scope)} - set(expected_cases))
 
-    impls = [("lpwm_stn.reference", reference), ("lpwm_stn (dispatch)", lpwm_stn)]
+    impls = [("lpwm_stn.reference", reference, 0.0),
+             ("lpwm_stn (dispatch)", lpwm_stn, tol)]
 
     print(f"fixture: {os.path.relpath(path)}  (torch {payload['meta']['torch']}, "
           f"baseline {(payload['meta'].get('git_commit') or '?')[:8]})")
@@ -323,12 +348,22 @@ def run(device=DEFAULT_DEVICE, scope="correctness", backend=None, tol=0.0, grad_
 
     ctx = lpwm_stn.use_backend(backend) if backend else _null_context()
     with ctx:
-        for impl_name, impl in impls:
+        for impl_name, impl, forward_tol in impls:
             print(f"\n[{impl_name}] vs baseline")
             for case in cases:
                 attempt(f"{impl_name} {case.name}",
                         lambda c=case, i=impl: check_case(
-                            c, i, expected_cases[c.name], device, tol, effective_grad_tol))
+                            c, i, expected_cases[c.name], device, forward_tol, effective_grad_tol))
+
+        if live_forward:
+            active_impl = lpwm_stn.get_backend()
+            live_cases = cases + (PRIOR_BENCH_CASES if scope == "all" else [])
+            accelerated = [case for case in live_cases
+                           if getattr(active_impl, case.op, None) is not None]
+            print(f"\n[live forward] full tensor vs reference ({len(accelerated)} accelerated cases)")
+            for case in accelerated:
+                attempt(f"live forward {case.name}", lambda c=case: check_live_forward(
+                    c, lpwm_stn, device, tol))
 
         suffix = "" if gradient_determinism else " (gradient rerun skipped explicitly)"
         print(f"\n[determinism] same inputs twice{suffix}")
@@ -408,11 +443,14 @@ def main(argv=None):
                     help="also run float64 autograd.gradcheck on tiny shapes")
     ap.add_argument("--skip-gradient-determinism", action="store_true",
                     help="keep forward rerun checks but skip CUDA gradient byte checks")
+    ap.add_argument("--live-forward", action="store_true",
+                    help="compare every accelerated forward element to a live reference tensor")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args(argv)
     return run(device=args.device, scope=args.scope, backend=args.backend, tol=args.tol,
                grad_tol=args.grad_tol, gradcheck=args.gradcheck, verbose=args.verbose,
-               gradient_determinism=not args.skip_gradient_determinism)
+               gradient_determinism=not args.skip_gradient_determinism,
+               live_forward=args.live_forward)
 
 
 if __name__ == "__main__":

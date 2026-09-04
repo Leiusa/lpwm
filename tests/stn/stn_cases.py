@@ -17,7 +17,7 @@ import torch
 
 from lpwm_stn import workloads
 
-__all__ = ["Case", "CORRECTNESS_CASES", "BENCH_CASES", "build_cases", "by_name"]
+__all__ = ["Case", "CORRECTNESS_CASES", "BENCH_CASES", "PRIOR_BENCH_CASES", "build_cases", "by_name"]
 
 #: shapes small enough to hash, diff and store; ``balls_1t`` is a real config
 #: (12 particles, 64px, 16px glimpses) with batch and horizon cut to 1
@@ -26,6 +26,10 @@ _CORRECTNESS_WORKLOADS = ("tiny", "balls_1t")
 #: full-size retained-particle shapes -- correctness is verified on the small
 #: ones, while these are available for opt-in reference checks and profiling
 _BENCH_WORKLOADS = ("bair", "bair64", "obj3d128", "balls")
+
+# Actual ParticleAttributeEncoder proposal counts. These are benchmark-only;
+# the retained-particle cases already pin the operation's numerical contract.
+_PRIOR_BENCH_WORKLOADS = ("bair_prior", "bair64_prior", "obj3d128_prior", "balls_prior")
 
 workloads.WORKLOADS["balls_1t"] = workloads.get("balls").scaled(batch_size=1, timestep_horizon=1)
 workloads.WORKLOADS["balls_1t"].name = "balls_1t"
@@ -227,6 +231,8 @@ def build_cases(workload_names):
 
 CORRECTNESS_CASES = build_cases(_CORRECTNESS_WORKLOADS)
 BENCH_CASES = build_cases(_BENCH_WORKLOADS)
+PRIOR_BENCH_CASES = [case for case in build_cases(_PRIOR_BENCH_WORKLOADS)
+                     if case.op == "stn_crop"]
 
 
 def by_name(cases):

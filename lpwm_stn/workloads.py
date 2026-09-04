@@ -73,7 +73,7 @@ class StnWorkload:
                 f"stn_batch={self.stn_batch})")
 
 
-def from_config(name, config_dir=_CONFIG_DIR):
+def from_config(name, config_dir=_CONFIG_DIR, n_kp_field="n_kp_enc"):
     """Build a workload from ``configs/<name>.json``."""
     with open(os.path.join(config_dir, f"{name}.json")) as f:
         cfg = json.load(f)
@@ -81,7 +81,7 @@ def from_config(name, config_dir=_CONFIG_DIR):
         name=name,
         batch_size=cfg["batch_size"],
         timestep_horizon=cfg["timestep_horizon"],
-        n_kp=cfg["n_kp_enc"],
+        n_kp=cfg[n_kp_field],
         image_size=cfg["image_size"],
         ch=cfg.get("ch", 3),
         anchor_s=cfg["anchor_s"],
@@ -91,6 +91,14 @@ def from_config(name, config_dir=_CONFIG_DIR):
 #: the four shapes worth tracking: the two extremes of particle count and the
 #: two glimpse sizes.  Built eagerly so a missing/renamed config fails loudly.
 WORKLOADS = {name: from_config(name) for name in ("bair", "bair64", "obj3d128", "balls")}
+
+# The attribute encoder crops every retained prior proposal before filtering.
+# Keep those larger, real call-site shapes available to the benchmark without
+# making the golden suite twice as expensive.
+for _name in ("bair", "bair64", "obj3d128", "balls"):
+    _prior = from_config(_name, n_kp_field="n_kp_prior")
+    _prior.name = f"{_name}_prior"
+    WORKLOADS[_prior.name] = _prior
 
 #: a deliberately tiny shape, so correctness tests and fixtures stay fast and
 #: the fixture file stays small enough to commit

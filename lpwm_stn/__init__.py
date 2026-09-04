@@ -148,3 +148,10 @@ def stn_crop(x, kp, patch_size, z_scale=None, padding_mode='border'):
 def stn_paste(kp_batch, patches_batch, img_size, scale=None, translation=None, scale_normalized=False):
     return resolve("stn_paste")(kp_batch, patches_batch, img_size, scale=scale, translation=translation,
                                 scale_normalized=scale_normalized)
+
+
+# Built-in optional backend. Its module imports without Triton installed and
+# falls back to the reference outside its supported CUDA/float32 crop path.
+from . import triton_backend  # noqa: E402  (registered after the public API exists)
+
+register_backend("triton", triton_backend)

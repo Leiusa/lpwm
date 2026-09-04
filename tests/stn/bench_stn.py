@@ -18,6 +18,7 @@ Reported per case:
 
     python tests/stn/bench_stn.py                     # cpu smoke test, small shapes
     python tests/stn/bench_stn.py --scope bench       # full config shapes
+    python tests/stn/bench_stn.py --scope prior       # attribute-encoder n_kp_prior crop shapes
     python tests/stn/bench_stn.py --device cuda --backend triton
     python tests/stn/bench_stn.py --compare reference triton
 """
@@ -33,7 +34,7 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 import lpwm_stn
-from tests.stn.stn_cases import BENCH_CASES, CORRECTNESS_CASES
+from tests.stn.stn_cases import BENCH_CASES, CORRECTNESS_CASES, PRIOR_BENCH_CASES
 
 
 def _sync(device):
@@ -97,9 +98,12 @@ def bench_case(case, device, iters, warmup, backward=True):
     return row
 
 
-def run(device="cpu", scope="correctness", iters=10, warmup=3, backend=None, backward=True):
-    cases = {"bench": BENCH_CASES, "correctness": CORRECTNESS_CASES,
+def run(device="cpu", scope="correctness", iters=10, warmup=3, backend=None, backward=True,
+        op=None):
+    cases = {"bench": BENCH_CASES, "prior": PRIOR_BENCH_CASES, "correctness": CORRECTNESS_CASES,
              "all": CORRECTNESS_CASES + BENCH_CASES}[scope]
+    if op is not None:
+        cases = [case for case in cases if case.op == op]
     ctx = lpwm_stn.use_backend(backend) if backend else _null_context()
     with ctx:
         name = lpwm_stn.get_backend_name()
@@ -113,7 +117,10 @@ def run(device="cpu", scope="correctness", iters=10, warmup=3, backend=None, bac
             rows.append(row)
             note = ""
             if "repeat_bytes" in row:
-                note = f"repeat alloc {row['repeat_bytes'] / 1e6:.0f} MB (x{row['inflate']})"
+                action = "avoids reference repeat" if (
+                    name != "reference" and getattr(lpwm_stn.get_backend(), "stn_crop", None)
+                ) else "repeat alloc"
+                note = f"{action} {row['repeat_bytes'] / 1e6:.0f} MB (x{row['inflate']})"
             fwd_peak = row["fwd_peak_bytes"] / 1e6
             train_peak = row["fwd_bwd_peak_bytes"] / 1e6
             print(f"{row['case']:<26} {row['fwd_ms']:>9.3f} {row['fwd_bwd_ms']:>11.3f} "
@@ -132,10 +139,14 @@ class _null_context:
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--device", default="cpu")
-    ap.add_argument("--scope", default="correctness", choices=("bench", "correctness", "all"))
+    ap.add_argument("--scope", default="correctness", choices=("bench", "prior", "correctness", "all"))
     ap.add_argument("--iters", type=int, default=10)
     ap.add_argument("--warmup", type=int, default=3)
     ap.add_argument("--backend", default=None)
+    ap.add_argument("--op", default=None,
+                    choices=("affine_grid_sample", "spatial_transform", "stn_crop", "stn_paste",
+                             "create_masks_fast", "create_masks_with_scale"),
+                    help="benchmark only one operation")
     ap.add_argument("--no-backward", action="store_true")
     ap.add_argument("--compare", nargs="+", default=None,
                     help="run the sweep once per named backend and print each in turn")
@@ -143,7 +154,7 @@ def main(argv=None):
 
     for backend in (args.compare or [args.backend]):
         run(device=args.device, scope=args.scope, iters=args.iters, warmup=args.warmup,
-            backend=backend, backward=not args.no_backward)
+            backend=backend, backward=not args.no_backward, op=args.op)
         print()
     return 0
 
