@@ -1,0 +1,146 @@
+{
+  "version": 2,
+  "frozen_at_utc": "2026-09-07T18:46:20Z",
+  "supersedes": "frozen_backward_policy.json (v1)",
+  "why_v1_was_incomplete": "v1 was built from particle reorderings of a single paste implementation and therefore omitted cross-implementation paste-VJP spread. The saved counterfactual showed it rejects the already-accepted Triton paste itself (grad[z_kp] max ratio 29.701), including when both sides are fed a byte-identical dL/dsample, which places the disagreement in the paste VJP rather than the composite feed.",
+  "derived_from": [
+    "reference.stn_paste + PyTorch reference composite",
+    "triton_backend.stn_paste (already accepted) + the same composite"
+  ],
+  "told_source": "lpwm_stn/triton_backend.py",
+  "told_blob_sha": "bd18b02c5e01c72a0715c12e1d5924cec21bafe4",
+  "told_commit": "389608c",
+  "reference_bounds_reused_from_v1": [
+    "z_kp",
+    "z_scale"
+  ],
+  "reference_bounds_regenerated": [
+    "z_depth"
+  ],
+  "paste_calls": "explicit reference.stn_paste / triton_backend.stn_paste; the generic lpwm_stn.stn_paste dispatcher is never used",
+  "never_derived_from": "the fused composite backward candidate",
+  "enveloped_gradients": [
+    "z_kp",
+    "z_scale",
+    "z_depth"
+  ],
+  "development_orders": [
+    [
+      "identity",
+      null
+    ],
+    [
+      "reverse",
+      null
+    ],
+    [
+      "cyclic_1",
+      1
+    ],
+    [
+      "cyclic_half",
+      "half"
+    ],
+    [
+      "cyclic_third",
+      "third"
+    ],
+    [
+      "rand_101",
+      101
+    ],
+    [
+      "rand_202",
+      202
+    ],
+    [
+      "rand_303",
+      303
+    ],
+    [
+      "rand_404",
+      404
+    ]
+  ],
+  "heldout_orders": [
+    [
+      "rand_911",
+      911
+    ],
+    [
+      "rand_922",
+      922
+    ],
+    [
+      "rand_933",
+      933
+    ],
+    [
+      "rand_944",
+      944
+    ],
+    [
+      "cyclic_2",
+      2
+    ]
+  ],
+  "atol": {
+    "dec_objects": 2e-05,
+    "z_kp": 1e-05,
+    "z_scale": 1e-05,
+    "obj_on": 1e-05,
+    "z_depth": 1e-05
+  },
+  "rtol": 1e-05,
+  "l2_tol": {
+    "dec_objects": 1e-05,
+    "z_kp": 1e-05,
+    "z_scale": 1e-05,
+    "obj_on": 1e-05,
+    "z_depth": 2e-05
+  },
+  "l2_ladder": [
+    1e-05,
+    2e-05,
+    5e-05,
+    0.0001,
+    0.0002,
+    0.0005
+  ],
+  "z_depth_l2_selected_from": "T_old development data only",
+  "measured": {
+    "told_dev_l2": {
+      "dec_objects": 8.275631557808083e-07,
+      "z_kp": 8.537629582860973e-06,
+      "z_scale": 7.356291007454274e-06,
+      "obj_on": 1.53188253193548e-07,
+      "z_depth": 1.3001774277654476e-05
+    },
+    "told_heldout_l2": {
+      "dec_objects": 8.278531709038361e-07,
+      "z_kp": 8.535454071534332e-06,
+      "z_scale": 7.3503620114934165e-06,
+      "obj_on": 1.5411380616114911e-07,
+      "z_depth": 1.3001774277654476e-05
+    },
+    "widened_elements": {
+      "z_kp": 3392,
+      "z_scale": 2998,
+      "z_depth": 1305
+    },
+    "total_elements": {
+      "z_kp": 3968,
+      "z_scale": 3840,
+      "z_depth": 1984
+    }
+  },
+  "validation": {
+    "told_heldout_envelope_violations": 0,
+    "reference_heldout_violations": 0,
+    "dec_objects_obj_on_heldout_violations": 0
+  },
+  "unchanged_from_v1": [
+    "dec_objects elementwise",
+    "obj_on elementwise"
+  ]
+}
