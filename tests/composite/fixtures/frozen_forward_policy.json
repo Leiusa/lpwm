@@ -1,0 +1,295 @@
+{
+  "measured_worst_abs": 1.7881393432617188e-07,
+  "measured_worst_rel": 2.7778221457703836e-07,
+  "established_forward_atol": 2e-05,
+  "FROZEN_forward_atol": 2e-06,
+  "FROZEN_forward_rtol": 1e-05,
+  "grad_dec_objects": {
+    "atol": 2e-05,
+    "rtol": 1e-05,
+    "form": "abs_diff <= atol + rtol*abs(reference)"
+  },
+  "other_grads": "bit-exact",
+  "frozen_before_kernel_exists": true,
+  "cases": [
+    {
+      "case": "bair_bs1",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 1.0000485550776261e-07,
+          "max_rel": 1.188402524897754e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 7.717271666152214e-08,
+          "max_rel": 1.7982833448909287e-07
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.4166174037964496e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 2.7778221457703836e-07
+        }
+      }
+    },
+    {
+      "case": "balls_bs2",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 1.2546121597178939e-07,
+          "max_rel": 1.2546121597178939e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.2415431138723676e-07,
+          "max_rel": 1.514712474369343e-07
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 1.7881393432617188e-07,
+          "max_rel": 1.7881393432617188e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.4543820348913522e-07
+        }
+      }
+    },
+    {
+      "case": "small_noscale",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 1.1520646536755663e-07,
+          "max_rel": 1.1520646536755663e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 6.544015862530728e-08,
+          "max_rel": 9.629038576963051e-08
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.4901161193847656e-08,
+          "max_rel": 2.192596443766435e-08
+        }
+      }
+    },
+    {
+      "case": "small_nomasks",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 8.7162687956166e-08,
+          "max_rel": 8.7162687956166e-08
+        },
+        "dec_objects_trans": {
+          "max_abs": 8.589586492080414e-08,
+          "max_rel": 1.2936725549280646e-07
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.1920928955078125e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.795404017072856e-07
+        }
+      }
+    },
+    {
+      "case": "k1_degenerate",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 6.618535142166593e-08,
+          "max_rel": 6.618535142166593e-08
+        },
+        "dec_objects_trans": {
+          "max_abs": 3.924824254486481e-08,
+          "max_rel": 7.91559199221744e-08
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        "dec_objects_trans": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        }
+      }
+    },
+    {
+      "case": "many_particles",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 9.563602354489831e-08,
+          "max_rel": 1.2250805690047402e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 4.936224518026222e-08,
+          "max_rel": 1.647423769188746e-07
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.5270498945991986e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 7.450580596923828e-08,
+          "max_rel": 2.486569045955178e-07
+        }
+      }
+    },
+    {
+      "case": "obj_on_all_zero",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        "dec_objects_trans": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        "dec_objects_trans": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        }
+      }
+    },
+    {
+      "case": "obj_on_all_one",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 1.2540494076507258e-07,
+          "max_rel": 1.2540494076507258e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.062584162880853e-07,
+          "max_rel": 1.253844419578537e-07
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.1920928955078125e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.4066641417045322e-07
+        }
+      }
+    },
+    {
+      "case": "overlapping_kp",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 1.1289774348721693e-07,
+          "max_rel": 1.1289774348721693e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 6.983426276141458e-08,
+          "max_rel": 1.3384323600366733e-07
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 1.1920928955078125e-07,
+          "max_rel": 1.1920928955078125e-07
+        },
+        "dec_objects_trans": {
+          "max_abs": 7.450580596923828e-08,
+          "max_rel": 1.4279664603807277e-07
+        }
+      }
+    },
+    {
+      "case": "offscreen_kp",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        "dec_objects_trans": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        "dec_objects_trans": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        }
+      }
+    },
+    {
+      "case": "depth_saturated",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 9.434769587812752e-08,
+          "max_rel": 9.434769587812752e-08
+        },
+        "dec_objects_trans": {
+          "max_abs": 6.014857845126897e-08,
+          "max_rel": 8.638584323922373e-08
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 5.960464477539063e-08,
+          "max_rel": 5.960464477539063e-08
+        },
+        "dec_objects_trans": {
+          "max_abs": 2.9802322387695312e-08,
+          "max_rel": 4.280231920086358e-08
+        }
+      }
+    },
+    {
+      "case": "near_zero_alpha",
+      "fp64": {
+        "bg_mask": {
+          "max_abs": 2.9602680751139587e-08,
+          "max_rel": 2.9602680751139587e-08
+        },
+        "dec_objects_trans": {
+          "max_abs": 4.899598555921456e-15,
+          "max_rel": 1.1846607949087303e-07
+        }
+      },
+      "permutation": {
+        "bg_mask": {
+          "max_abs": 0.0,
+          "max_rel": 0.0
+        },
+        "dec_objects_trans": {
+          "max_abs": 1.7763568394002505e-15,
+          "max_rel": 4.2950057329736525e-08
+        }
+      }
+    }
+  ],
+  "rationale": "Measured envelope (FP64 composite oracle + 6 legal particle permutations over 12 cases) is worst 1.788e-07 absolute / 2.778e-07 relative -- more than 100x tighter than the established 2e-5. Per instruction, the stricter pre-kernel envelope is adopted: atol=2e-6 (about 11x the measured worst absolute), rtol=1e-5, combined as abs_diff <= atol + rtol*abs(reference).",
+  "known_gap": "The permutation study bounds reduction-order freedom over particles, and the FP64 study bounds the composite's discretization error. NEITHER bounds a difference in FMA grouping inside the bilinear interpolation, which a Triton kernel may contract differently. That cannot be measured before a kernel exists. If the kernel misses this envelope, the response is to investigate whether the cause is FMA contraction or a bug -- NOT to loosen the bound after the fact.",
+  "frozen_at_utc": "2026-09-07T03:08:04Z"
+}
