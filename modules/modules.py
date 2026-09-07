@@ -5303,7 +5303,8 @@ class DLPDecoder(nn.Module):
         a_obj, rgb_obj = torch.split(dec_objects_trans, [1, dec_objects_trans.shape[2] - 1], dim=2)
         return dec_objects, a_obj, rgb_obj
 
-    def get_objects_alpha_rgb_with_depth(self, a_obj, rgb_obj, obj_on, z_depth, eps=1e-5):
+    def get_objects_alpha_rgb_with_depth(self, a_obj, rgb_obj, obj_on, z_depth, eps=1e-5,
+                                         return_alpha_masks=True):
         # stitching the glimpses by factoring the alpha maps and the particle's inferred depth
         # obj_on: [bs, n_kp, 1]
         # z_depth: [bs, n_kp, 1]
@@ -5317,20 +5318,29 @@ class DLPDecoder(nn.Module):
         # this imitates softmax to move objects on the depth axis
         dec_objects_trans = (rgba_obj * importance_map).sum(dim=1)
         alpha_mask = 1.0 - (importance_map * a_obj).sum(dim=1)
-        a_obj = importance_map * a_obj
+        # The per-particle alpha stack is an output artifact only: it is bound but
+        # never read in either ELBO path, so it carries no gradient into the loss,
+        # and every consumer is plotting or evaluation. `alpha_mask` above forms its
+        # own product and reduces it, so skipping this line changes nothing else.
+        # return_alpha_masks=False therefore leaves every other value bit-identical
+        # while not retaining a [bs, n_kp, 1, im_size, im_size] tensor.
+        if return_alpha_masks:
+            a_obj = importance_map * a_obj
+        else:
+            a_obj = None
         return a_obj, alpha_mask, dec_objects_trans
 
     def decode_objects(self, z_kp, z_features, obj_on, z_scale=None, translation=None, z_depth=None,
-                       z_ctx=None):
+                       z_ctx=None, return_alpha_masks=True):
         # stitching the decoded latent particles -> RGB, factoring the alpha maps and depths
         dec_objects, a_obj, rgb_obj = self.get_objects_alpha_rgb(z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx,
                                                                  translation=translation)
-        alpha_masks, bg_mask, dec_objects_trans = self.get_objects_alpha_rgb_with_depth(a_obj, rgb_obj, obj_on=obj_on,
-                                                                                        z_depth=z_depth)
+        alpha_masks, bg_mask, dec_objects_trans = self.get_objects_alpha_rgb_with_depth(
+            a_obj, rgb_obj, obj_on=obj_on, z_depth=z_depth, return_alpha_masks=return_alpha_masks)
         return dec_objects, dec_objects_trans, alpha_masks, bg_mask
 
     def decode_all(self, z, z_scale, z_features, obj_on, z_depth, z_bg_features, z_ctx=None,
-                   warmup=False):
+                   warmup=False, return_alpha_masks=True):
         if len(z.shape) == 4:
             # z: [bs, T, n_kp, 2]
             batch_size = z.shape[0]
@@ -5351,7 +5361,7 @@ class DLPDecoder(nn.Module):
             obj_on = obj_on.squeeze(-1)
         # a wrapper function to decode latent particles into and RGB image
         object_dec_out = self.decode_objects(z, z_features, obj_on, z_depth=z_depth, z_scale=z_scale,
-                                             z_ctx=z_ctx)
+                                             z_ctx=z_ctx, return_alpha_masks=return_alpha_masks)
         dec_objects, dec_objects_trans, alpha_masks, bg_mask = object_dec_out
         bg_rec = self.bg_dec(z_bg_features, z_ctx)
         rec = bg_mask * bg_rec + dec_objects_trans
@@ -5361,8 +5371,9 @@ class DLPDecoder(nn.Module):
         return decoder_out
 
     def forward(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx=None,
-                warmup=False):
-        return self.decode_all(z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup)
+                warmup=False, return_alpha_masks=True):
+        return self.decode_all(z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup,
+                               return_alpha_masks=return_alpha_masks)
 
 
 class DLPContext(nn.Module):

@@ -805,7 +805,7 @@ class DLP(nn.Module):
         return enc_dict
 
     def decode_all(self, z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx,
-                   warmup=False, filter_key=None):
+                   warmup=False, filter_key=None, return_alpha_masks=True):
         if filter_key is not None:
             orig_shape = z.shape
             # filter_key: [batch_size, n_kp]
@@ -840,7 +840,8 @@ class DLP(nn.Module):
                 z_features = z_features.reshape(orig_shape[0], orig_shape[1], *z_features.shape[1:])
                 obj_on_sample = obj_on_sample.reshape(orig_shape[0], orig_shape[1], *obj_on_sample.shape[1:])
 
-        dec_dict = self.decoder_module(z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup)
+        dec_dict = self.decoder_module(z, z_scale, z_features, obj_on_sample, z_depth, z_bg_features, z_ctx, warmup,
+                                       return_alpha_masks=return_alpha_masks)
 
         dec_objects = dec_dict['dec_objects']
         dec_objects_trans = dec_dict['dec_objects_trans']
@@ -1064,7 +1065,7 @@ class DLP(nn.Module):
     def forward(self, x, deterministic=False, warmup=False, with_loss=False, beta_kl=0.1, beta_dyn=0.1,
                 beta_rec=1.0, kl_balance=0.001, dynamic_discount=None, recon_loss_type="mse", recon_loss_func=None,
                 balance=0.5, beta_dyn_rec=1.0, num_static=None, actions=None, actions_mask=None, lang_embed=None,
-                beta_obj=0.0, done_mask=None, x_goal=None):
+                beta_obj=0.0, done_mask=None, x_goal=None, return_alpha_masks=True):
         if len(x.shape) == 4:
             # x: [bs, ch, h, w]
             batch_size = x.size(0)
@@ -1148,7 +1149,7 @@ class DLP(nn.Module):
         filter_key = z_base_var.sum(-1) if (
                 self.filter_particles_in_decoder and self.n_kp_enc != self.n_kp_dec) else None
         dec_dict = self.decode_all(z, z_scale, z_features, z_obj_on, z_depth, z_bg_features, z_context,
-                                   warmup, filter_key=filter_key)
+                                   warmup, filter_key=filter_key, return_alpha_masks=return_alpha_masks)
 
         bg_mask = dec_dict['bg_mask']
         dec_objects = dec_dict['dec_objects']
