@@ -144,7 +144,11 @@ def _composite_forward_kernel(
                             vx0, vx1, vy0, vy1, stride_ph, stride_pw, active, PATCH)
         a_obj = on * alpha
         imp = a_obj * tl.sigmoid(-dep)
-        w = imp / denom
+        # importance = u / S. Triton's `/` lowers to div.full.f32, which differs
+        # from IEEE round-to-nearest by up to 2 ULP on ~29% of values; the
+        # reference uses torch's correctly-rounded FP32 divide. Same operation,
+        # same precision -- only the rounding mode is pinned.
+        w = tl.math.div_rn(imp, denom)
         acc_r += (a_obj * r) * w
         acc_g += (a_obj * g) * w
         acc_b += (a_obj * b) * w
