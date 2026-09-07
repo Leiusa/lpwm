@@ -277,15 +277,22 @@ def train_dlp(config_path='./configs/shapes.json'):
         batch_losses_kl_obj_on = []
         batch_psnrs = []
 
+        # decided once per epoch: the post-loop plotting block below reuses the
+        # LAST batch's tensors, so only that batch needs the per-particle masks
+        plot_this_epoch = (epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1)
         pbar = tqdm(iterable=dataloader, disable=not accelerator.is_local_main_process)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             x = batch[0].to(accelerator.device)
             if len(x.shape) == 4:
                 # [bs, ch, h, w]
                 x = x.unsqueeze(1)
             warmup = (epoch < warmup_epoch)
             # forward pass
-            model_output = model(x, warmup=warmup, with_loss=True,
+            # alpha_masks are consumed only by the post-loop plotting block, which
+            # reads the last batch's value; every other batch can skip materializing
+            # the [bs, n_kp, 1, h, w] stack (see docs/stn_alpha_masks_api_plan.md)
+            need_masks = plot_this_epoch and batch_idx == len(dataloader) - 1
+            model_output = model(x, warmup=warmup, with_loss=True, return_alpha_masks=need_masks,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
@@ -411,7 +418,7 @@ def train_dlp(config_path='./configs/shapes.json'):
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
 
-        if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
+        if plot_this_epoch:
             if accelerator.is_main_process:
                 x = x.view(-1, *x.shape[2:])
                 # for plotting purposes

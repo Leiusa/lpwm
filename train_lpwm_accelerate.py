@@ -350,8 +350,11 @@ def train_ddlp(config_path='./configs/balls.json'):
         batch_losses_kl_context = []
         batch_psnrs = []
 
+        # decided once per epoch: the post-loop plotting block below reuses the
+        # LAST batch's tensors, so only that batch needs the per-particle masks
+        plot_this_epoch = (epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1)
         pbar = tqdm(iterable=dataloader, disable=not accelerator.is_local_main_process)
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             x = batch[0].to(accelerator.device)
             actions = None if not action_condition else batch[1].to(accelerator.device)
             lang_str = None if not language_condition else batch[2]
@@ -372,7 +375,12 @@ def train_ddlp(config_path='./configs/balls.json'):
                 if ep_done_mask is not None:
                     ep_done_mask = ep_done_mask.permute(0, 2, 1)
                     ep_done_mask - ep_done_mask.reshape(-1, *ep_done_mask.shape[2:])
+            # alpha_masks are consumed only by the post-loop plotting block, which
+            # reads the last batch's value; every other batch can skip materializing
+            # the [bs, n_kp, 1, h, w] stack (see docs/stn_alpha_masks_api_plan.md)
+            need_masks = plot_this_epoch and batch_idx == len(dataloader) - 1
             model_output = model(x, actions=actions, lang_embed=lang_embed, warmup=warmup, with_loss=True,
+                                 return_alpha_masks=need_masks,
                                  beta_kl=beta_kl,
                                  beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
                                  dynamic_discount=discount, recon_loss_type=recon_loss_type,
@@ -513,7 +521,7 @@ def train_ddlp(config_path='./configs/balls.json'):
         accelerator.wait_for_everyone()
         unwrapped_model = accelerator.unwrap_model(model)
 
-        if epoch % eval_epoch_freq == 0 or epoch == num_epochs - 1:
+        if plot_this_epoch:
             if accelerator.is_main_process:
                 x = x.view(-1, *x.shape[2:])
                 mu_plot = mu_tot.clamp(min=kp_range[0], max=kp_range[1])
