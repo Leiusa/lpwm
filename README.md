@@ -1,4 +1,46 @@
-# lpwm
+# LPWM STN GPU Optimization
+
+This research branch contains my work with Carnegie Mellon University's
+Robotics Institute and the R-PAD Lab, advised by Tal Daniel, on accelerating
+the Spatial Transformer Network (STN) stage of Latent Particle World Models.
+It is based on the official LPWM repository preserved below.
+
+## What this branch adds
+
+- A pluggable STN backend with stable crop, inverse-rendering, and mask
+  interfaces, plus PyTorch reference fallbacks for unsupported configurations.
+- Custom Triton forward and backward kernels that compute affine coordinates
+  and bilinear interpolation without repeated inputs or dense sampling grids.
+- A fused inverse-rendering and depth-weighted alpha-compositing path that
+  reduces across particles without materializing a per-particle RGBA canvas.
+- CUDA output and gradient correctness tests, CPU policy tests, isolated-kernel
+  benchmarks, and a whole-model measurement harness with provenance and
+  profiler-attribution checks.
+
+## Preliminary RTX 4090 results
+
+| Measurement | Result |
+| --- | ---: |
+| Isolated BAIR crop inference | up to **31.3x** faster |
+| Isolated BAIR paste inference | up to **10.9x** faster |
+| Whole-model training latency | **280.384 ms -> 258.442 ms** (~8% lower) |
+| Whole-model training peak allocation | **18,493.1 MB -> 17,119.4 MB** (~7% lower) |
+
+Isolated operator results and whole-model results are reported separately. The
+whole-model measurements are preliminary 10-iteration validation results and
+are not presented as final paper benchmarks.
+
+## Technical documentation
+
+- [Optimization overview](docs/stn_optimization.md)
+- [End-to-end benchmark methodology](benchmarks/stn/README.md)
+- [Triton crop design](docs/stn_triton_crop.md)
+- [Triton inverse-rendering design](docs/stn_triton_paste.md)
+- [Fused-compositing design](docs/stn_composite_fusion_design.md)
+
+---
+
+# Upstream LPWM
 
 <p align="center">
   <img src="https://img.shields.io/badge/conference-ICLR%202026-orange" />
