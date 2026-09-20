@@ -10,9 +10,7 @@ with the handful of genuine renames listed in :data:`RENAMES`.
 import inspect
 import json
 
-from models import DLP
-
-__all__ = ["RENAMES", "build"]
+__all__ = ["RENAMES", "build", "sequence_length"]
 
 #: config keys whose name differs from the DLP constructor parameter
 RENAMES = {
@@ -27,6 +25,8 @@ _TUPLE_PARAMS = ("obj_ch_mult", "obj_ch_mult_prior", "bg_ch_mult")
 
 def build(config_path, device="cuda"):
     """Return ``(model, cfg, kwargs)``. Params absent from the config keep their defaults."""
+    from models import DLP
+
     with open(config_path) as f:
         cfg = json.load(f)
 
@@ -45,9 +45,15 @@ def build(config_path, device="cuda"):
 
 
 def sequence_length(cfg):
-    """Frames the loss expects: an initial frame plus ``timestep_horizon`` predicted steps.
+    """Frames the loss expects.
 
-    ``calc_dyn_elbo`` reshapes the reconstruction to ``[bs, timestep_horizon + 1, -1]``,
-    so feeding exactly ``timestep_horizon`` frames raises a shape error.
+    A dynamics model (``timestep_horizon > 1``, models.py ``is_dynamics_model``) needs an
+    initial frame plus ``timestep_horizon`` predicted steps: ``calc_dyn_elbo`` reshapes the
+    reconstruction to ``[bs, timestep_horizon + 1, -1]``, so exactly ``timestep_horizon``
+    frames raises a shape error.
+
+    A static DLP (``timestep_horizon == 1``) sees one frame per sample, as in train_dlp.py.
+    ``calc_static_elbo`` would silently accept extra frames, so a wrong count does not fail.
     """
-    return cfg["timestep_horizon"] + 1
+    horizon = cfg["timestep_horizon"]
+    return horizon + 1 if horizon > 1 else 1

@@ -33,8 +33,10 @@ through a completely uninstrumented path.
 """
 
 import argparse
+import hashlib
 import json
 import os
+import socket
 import statistics
 import subprocess
 import sys
@@ -317,15 +319,44 @@ def repo_record(repo_root):
         return subprocess.check_output(["git", "-C", repo_root, *a], text=True,
                                        stderr=subprocess.DEVNULL).strip()
     try:
+        dirty = git("status", "--porcelain")
         return {"repo_root": repo_root, "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
                 "commit": git("rev-parse", "HEAD"),
-                "clean": git("status", "--porcelain") == "",
+                "clean": dirty == "", "dirty_paths": dirty.splitlines(),
                 "remotes": git("remote", "-v").splitlines()}
     except Exception as exc:
         return {"repo_root": repo_root, "error": str(exc)}
 
 
-def main(argv=None):
+def file_sha256(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
+def tensors_sha256(tensors):
+    """Hash of raw tensor bytes, in order. Proves two runs saw identical weights / inputs."""
+    h = hashlib.sha256()
+    for t in tensors:
+        h.update(t.detach().cpu().contiguous().numpy().tobytes())
+    return h.hexdigest()
+
+
+def initial_loss(model, x, betas, return_alpha_masks, seed):
+    """Loss of one train-mode forward from the untouched initial weights, identically seeded.
+
+    No optimizer step and no backward: it is the value both backends must agree on before
+    any timing is read. BatchNorm running statistics, if any, are updated by this forward,
+    identically in every process.
+    """
+    model.train()
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    with torch.no_grad():
+        out = model(x, deterministic=False, with_loss=True, return_alpha_masks=return_alpha_masks, **betas)
+    return {k: float(v) for k, v in out["loss_dict"].items() if torch.is_tensor(v) and v.ndim == 0}
+
+
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo-root", default=os.path.dirname(os.path.dirname(_HERE)),
@@ -338,8 +369,15 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--batch-size", type=int, default=None)
     ap.add_argument("--gradx-microprofile", action="store_true")
+    ap.add_argument("--return-alpha-masks", action=argparse.BooleanOptionalAction, default=True,
+                    help="pass return_alpha_masks to the model in every measured step (default: True, "
+                         "the model's own default); both backends must be run with the same value")
     ap.add_argument("--out", default=None)
-    args = ap.parse_args(argv)
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
 
     repo_root = _bootstrap(args.repo_root)
     config = args.config if os.path.isabs(args.config) else os.path.join(repo_root, args.config)
@@ -361,21 +399,35 @@ def main(argv=None):
     betas = {"beta_kl": cfg.get("beta_kl", 0.1), "beta_dyn": cfg.get("beta_dyn", 0.1),
              "beta_rec": cfg.get("beta_rec", 1.0)}
     opt = torch.optim.Adam(model.parameters(), lr=cfg.get("lr", 2e-4))
+    alpha = args.return_alpha_masks
 
     def infer():
         model.eval()
         with torch.no_grad():
-            model(x, deterministic=True, with_loss=False)
+            model(x, deterministic=True, with_loss=False, return_alpha_masks=alpha)
 
     def train():
         model.train()
         opt.zero_grad(set_to_none=True)
-        loss_of(model(x, deterministic=False, with_loss=True, **betas)).backward()
+        loss_of(model(x, deterministic=False, with_loss=True, return_alpha_masks=alpha, **betas)).backward()
         opt.step()
 
+    weights_sha, input_sha = tensors_sha256(model.parameters()), tensors_sha256([x])
     lpwm_stn.set_backend(args.backend)
+    init_loss = initial_loss(model, x, betas, alpha, args.seed)
 
-    results = {"shapes": {"input": list(x.shape), "batch_size": x.shape[0],
+    results = {"model": {"is_dynamics_model": bool(model.is_dynamics_model),
+                         "context_dim": model.context_dim,
+                         "initial_weights_sha256": weights_sha, "input_sha256": input_sha,
+                         "initial_loss": init_loss},
+               "loss_configuration": {
+                   "return_alpha_masks": alpha,
+                   "recon_loss_type_applied": "model default (mse): this harness does not pass recon_loss_type",
+                   "recon_loss_type_in_config": cfg.get("recon_loss_type"),
+                   "kl_balance_applied": "model default: this harness does not pass kl_balance",
+                   "kl_balance_in_config": cfg.get("kl_balance"),
+                   "betas": betas},
+               "shapes": {"input": list(x.shape), "batch_size": x.shape[0],
                           "seq_len": x.shape[1], "timestep_horizon": cfg["timestep_horizon"],
                           "image_size": cfg["image_size"], "n_kp_enc": cfg["n_kp_enc"],
                           "anchor_s": cfg["anchor_s"], "ch": cfg["ch"], "dtype": str(x.dtype),
@@ -393,10 +445,17 @@ def main(argv=None):
     if args.gradx_microprofile:
         results["crop_gradx_microprofile"] = crop_gradx_microprofile(cfg, args.backend, args.seed)
 
-    report = {"schema_version": 2,
+    kind = ("synthetic-input static DLP benchmark (torch.rand images; not real-dataset training)"
+            if not model.is_dynamics_model else
+            "synthetic-input LPWM dynamics-model benchmark (torch.rand images; not real-dataset training)")
+    report = {"schema_version": 3, "benchmark_kind": kind,
               "experiment": f"lpwm-e2e-{os.path.basename(config).replace('.json','')}-{args.backend}",
               "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-              "config": config, "backend": args.backend, "seed": args.seed,
+              "host": socket.gethostname(), "slurm_job_id": os.environ.get("SLURM_JOB_ID"),
+              "config": config, "config_sha256": file_sha256(config), "config_content": cfg,
+              "harness_sha256": {n: file_sha256(os.path.join(_HERE, n))
+                                 for n in ("bench_e2e.py", "build_model.py", "attribution.py")},
+              "backend": args.backend, "seed": args.seed,
               "sync": "torch.cuda.synchronize() around every measured region",
               "metric_semantics": {
                   "D_clean_wall_ms": "median of the uninstrumented timed loop; the ONLY basis for "

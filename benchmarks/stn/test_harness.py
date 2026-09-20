@@ -151,6 +151,112 @@ def test_report_schema_shape():
     assert report["results"]["inference"]["clean"]["D_clean_wall_ms"] == 1.0
 
 
+def _derived_static_config(tmp_dir, batch_size=1):
+    """bair.json as a static DLP: horizon 1 and none of the keys shapes.json (a real static
+    config) does not have -- those 18 are read only by the dynamics model."""
+    with open(os.path.join(REPO, "configs/bair.json")) as f:
+        bair = json.load(f)
+    with open(os.path.join(REPO, "configs/shapes.json")) as f:
+        shapes = json.load(f)
+    cfg = {k: v for k, v in bair.items() if k in shapes}
+    cfg.update(timestep_horizon=1, batch_size=batch_size)
+    path = os.path.join(tmp_dir, "static_bair128.json")
+    with open(path, "w") as f:
+        json.dump(cfg, f)
+    return path, cfg, sorted(set(bair) - set(shapes))
+
+
+def test_sequence_length_static_is_one_frame_and_dynamics_adds_the_initial_frame():
+    """A static DLP takes ONE frame (train_dlp.py). Feeding horizon+1=2 frames does not raise in
+    calc_static_elbo, it just measures the wrong workload -- so this is pinned here."""
+    from build_model import sequence_length
+    assert sequence_length({"timestep_horizon": 1}) == 1
+    assert sequence_length({"timestep_horizon": 2}) == 3
+    assert sequence_length({"timestep_horizon": 16}) == 17
+    for name, want in (("shapes", 1), ("bair", 17)):
+        with open(os.path.join(REPO, f"configs/{name}.json")) as f:
+            assert sequence_length(json.load(f)) == want, name
+
+
+def test_return_alpha_masks_defaults_true_and_accepts_explicit_values():
+    base = ["--config", "c.json", "--backend", "reference"]
+    parse = bench_e2e.build_parser().parse_args
+    assert parse(base).return_alpha_masks is True
+    assert parse(base + ["--return-alpha-masks"]).return_alpha_masks is True
+    assert parse(base + ["--no-return-alpha-masks"]).return_alpha_masks is False
+
+
+def test_derived_static_config_is_static_and_drops_only_dynamics_keys():
+    from build_model import sequence_length
+    with tempfile.TemporaryDirectory() as tmp:
+        _, cfg, dropped = _derived_static_config(tmp)
+    assert cfg["timestep_horizon"] == 1 and sequence_length(cfg) == 1
+    assert cfg["image_size"] == 128 and cfg["n_kp_enc"] == 90         # still the BAIR workload
+    assert {"pint_dim", "context_dim", "cond_steps", "beta_dyn"} <= set(dropped)
+    assert not (set(dropped) & set(cfg))
+
+
+def test_derived_static_config_builds_a_non_dynamics_model():
+    """The real check that timestep_horizon=1 gives is_dynamics_model=False. Needs the model's
+    own dependencies (imageio, cv2, ...); reported as skipped, never as passed, without them."""
+    try:
+        from build_model import build
+        import models  # noqa: F401
+    except ImportError as exc:
+        print(f"     (SKIPPED model build, dependency missing: {exc})")
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        path, _, _ = _derived_static_config(tmp)
+        model, _, kwargs = build(path, device="cpu")
+    assert model.is_dynamics_model is False
+    assert model.context_dim == 0
+    assert kwargs["timestep_horizon"] == 1
+    assert not ({"pint_dim", "context_dim", "cond_steps"} & set(kwargs))
+
+
+def test_tensors_sha256_distinguishes_weights_and_is_reproducible():
+    import torch
+    a, b = torch.arange(6.0), torch.arange(6.0)
+    c = b.clone()
+    c[3] += 1e-6
+    assert bench_e2e.tensors_sha256([a]) == bench_e2e.tensors_sha256([b])
+    assert bench_e2e.tensors_sha256([a]) != bench_e2e.tensors_sha256([c])
+
+
+def test_saved_tensor_ledger_dedupes_storage_attributes_to_innermost_scope_and_excludes():
+    import torch
+    import attribute_memory as am
+
+    def run(exclude=()):
+        ledger = am.Ledger(exclude, cuda_only=False)
+        x = torch.randn(4, 4, requires_grad=True)
+        w = torch.randn(4, 4)
+        with ledger.hooks():
+            with ledger.scope("outer"):
+                a = x * w                # w requires no grad, so only w is saved
+                with ledger.scope("inner"):
+                    a * a                # both operands are `a`: one storage, saved once
+        assert ledger.stack == ["other"], "scope stack must unwind"
+        return ledger.summary(), w
+
+    summary, w = run()
+    assert summary["by_scope_mb"]["outer"] * 1e6 == 64 and summary["by_scope_mb"]["inner"] * 1e6 == 64
+    assert summary["n_storages_by_scope"] == {"outer": 1, "inner": 1}
+    assert summary["total_mb"] * 1e6 == 128
+    grouped = summary["grouped_complete"]       # nothing is truncated: groups add up to the total
+    assert abs(sum(g["total_mb"] for g in grouped) - summary["total_mb"]) < 1e-12
+    assert sum(g["n_storages"] for g in grouped) == 2
+    excluded, _ = run(exclude=set())            # fresh tensors each run, so exclusion is checked below
+    assert excluded["total_mb"] == summary["total_mb"]
+    ledger = am.Ledger(cuda_only=False)
+    x = torch.randn(4, 4, requires_grad=True)
+    w = torch.randn(4, 4)
+    ledger.exclude.add(w.untyped_storage().data_ptr())
+    with ledger.hooks():
+        x * w
+    assert ledger.summary()["total_mb"] == 0.0, "an excluded storage (weights / inputs) is not counted"
+
+
 def test_scope_probe_targets_cover_all_stn_entry_points():
     from attribution import SCOPE_BUCKETS, SCOPE_PREFIX
     targets = bench_e2e.ScopeProbe.TARGETS
