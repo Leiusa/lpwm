@@ -9,6 +9,7 @@ import torch.nn as nn
 from torch.nn import functional as F
 from torch.distributions import Beta
 from lpwm_stn import create_masks_fast, create_masks_with_scale, stn_crop, stn_paste
+from lpwm_stn.composite_autograd import composite_fused, fused_composite_supported
 from utils.util_func import reparameterize, modulate
 # modules
 from modules.vision_modules import Encoder, Decoder
@@ -5153,6 +5154,9 @@ class DLPDecoder(nn.Module):
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
                  init_conv_bg_std=0.005,  # std for conv bg normal dist (<fg -> prioritize fg in learning)
+
+                 # opt-in fused paste + alpha/depth composite (lpwm_stn/composite_autograd.py); False = original path
+                 fused_composite=False,
                  ):
         """
         DLP Decoder Module
@@ -5222,6 +5226,8 @@ class DLPDecoder(nn.Module):
         self.use_resblock = use_resblock
         self.decode_with_ctx = decode_with_ctx
         self.normalize_rgb = normalize_rgb
+        self.fused_composite = bool(fused_composite)
+        self.fused_composite_calls = 0  # times the fused path ran; lets a run prove which path it used
         self.timestep_horizon = (timestep_horizon + 1) if timestep_horizon > 1 else 1
         self.cnn_mid_blocks = cnn_mid_blocks
         self.mlp_hidden_dim = mlp_hidden_dim
@@ -5330,8 +5336,29 @@ class DLPDecoder(nn.Module):
             a_obj = None
         return a_obj, alpha_mask, dec_objects_trans
 
+    def _decode_objects_fused(self, z_kp, z_features, obj_on, z_scale, translation, z_depth, z_ctx,
+                              return_alpha_masks):
+        # same glimpses as get_objects_alpha_rgb, but paste + composite run in one fused kernel: the
+        # per-particle [bs, n_kp, 4, im_size, im_size] canvas is never formed. Unsupported input -> ValueError.
+        dec_objects = self.particle_dec(z_features, context=z_ctx)  # [bs * n_kp, 4, patch_size, patch_size]
+        dec_objects = dec_objects.view(-1, z_kp.shape[1], *dec_objects.shape[1:])  # [bs, n_kp, 4, p, p]
+        if translation is not None:
+            ok, reason = False, "translation is not None (the fused kernel has no translation input)"
+        else:
+            ok, reason = fused_composite_supported(dec_objects, z_kp, z_scale, obj_on, z_depth, self.feature_map_size)
+        if not ok:
+            raise ValueError(f"fused_composite=True but the input is unsupported: {reason}")
+        alpha_masks, bg_mask, dec_objects_trans = composite_fused(
+            dec_objects, z_kp, z_scale, obj_on, z_depth, self.feature_map_size,
+            return_alpha_masks=return_alpha_masks)
+        self.fused_composite_calls += 1
+        return dec_objects, dec_objects_trans, alpha_masks, bg_mask
+
     def decode_objects(self, z_kp, z_features, obj_on, z_scale=None, translation=None, z_depth=None,
                        z_ctx=None, return_alpha_masks=True):
+        if self.fused_composite:
+            return self._decode_objects_fused(z_kp, z_features, obj_on, z_scale, translation, z_depth, z_ctx,
+                                              return_alpha_masks)
         # stitching the decoded latent particles -> RGB, factoring the alpha maps and depths
         dec_objects, a_obj, rgb_obj = self.get_objects_alpha_rgb(z_kp, z_features, z_scale=z_scale, z_ctx=z_ctx,
                                                                  translation=translation)
