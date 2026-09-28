@@ -193,7 +193,6 @@ def test_unsupported_input_raises_with_reason_and_off_path_still_runs():
     ins = _decoder_inputs(d_on)
     cases = {
         "translation": (dict(translation=torch.zeros(3, d_on.n_kp_enc, 2, device="cuda")), "translation", True),
-        "non-contiguous": (dict(z_kp=ins["z_kp"].transpose(0, 1).contiguous().transpose(0, 1)), "contiguous", True),
         "dtype": (dict(z_depth=ins["z_depth"].double()), "dtype", False),
         "cpu": (dict(obj_on=ins["obj_on"].cpu()), "cpu", False),
     }
@@ -208,6 +207,29 @@ def test_unsupported_input_raises_with_reason_and_off_path_still_runs():
         if off_ok:
             _call(d_off, ins, **over)              # the original path supports it
     assert d_on.fused_composite_calls == before, "a rejected call must not count as a fused call"
+
+
+def test_non_contiguous_z_kp_obj_on_z_depth_z_scale_are_normalized_not_rejected():
+    """`_decode_objects_fused` calls .contiguous() on z_kp/obj_on/z_depth/z_scale before the support check (found via
+    deterministic=True aliasing mu_* straight from a non-contiguous torch.chunk() view -- see docs/dlp_full_stack_report.md).
+    A non-contiguous but otherwise valid input must therefore be ACCEPTED and match the contiguous-input result, not raise."""
+    _env()
+    _, on, _ = _pair()
+    dec = on.decoder_module
+    ins = _decoder_inputs(dec)
+    noncontig = dict(ins)
+    noncontig["z_kp"] = ins["z_kp"].transpose(0, 1).contiguous().transpose(0, 1)
+    noncontig["obj_on"] = ins["obj_on"].transpose(0, 1).contiguous().transpose(0, 1)
+    noncontig["z_depth"] = ins["z_depth"].transpose(0, 1).contiguous().transpose(0, 1)
+    noncontig["z_scale"] = ins["z_scale"].transpose(0, 1).contiguous().transpose(0, 1)
+    for k in ("z_kp", "obj_on", "z_depth", "z_scale"):
+        assert not noncontig[k].is_contiguous(), f"{k}: test setup did not actually produce a non-contiguous tensor"
+    before = dec.fused_composite_calls
+    out_noncontig = _call(dec, noncontig)
+    assert dec.fused_composite_calls == before + 1, "a normalized (now-contiguous) call must still count as a fused call"
+    out_contig = _call(dec, ins)
+    for a, b in zip(out_noncontig, out_contig):
+        assert torch.equal(a, b), "normalizing a non-contiguous input must not change the result"
 
 
 def test_full_model_step_uses_fusion_once_and_all_parameters_get_finite_gradients():

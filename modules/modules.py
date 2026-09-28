@@ -1939,6 +1939,10 @@ class ObjectDecoderCNN(nn.Module):
                  init_zero_bias=True,  # zero bias for conv and linear layers
                  init_conv_layers=True,  # initialize conv layers with normal dist
                  init_conv_fg_std=0.02,  # std for conv fg normal dist
+                 # opt-in (default off): run the CNN with channels_last conv weights and activations. The output is
+                 # converted back to standard contiguous NCHW right after the CNN, so nothing downstream changes.
+                 # It changes cuDNN's algorithm choice, so results are not bit-identical (docs/dlp_particle_dec_channels_last.md).
+                 channels_last=False,
                  ):
         super().__init__()
 
@@ -1954,6 +1958,8 @@ class ObjectDecoderCNN(nn.Module):
         self.embed_position = embed_position
         self.use_resblock = use_resblock
         self.features_dim = bottleneck_size
+        self.channels_last = bool(channels_last)
+        self.channels_last_calls = 0  # forward calls that took the channels_last path; lets a run prove which path it used
         self.activation = activation
         self.cnn_mid_blocks = cnn_mid_blocks
         self.mlp_hidden_dim = mlp_hidden_dim
@@ -2002,6 +2008,8 @@ class ObjectDecoderCNN(nn.Module):
                            padding_mode=pad_mode, residual=self.use_resblock, upsample_method='nearest',
                            mid_blocks=cnn_mid_blocks)
         self.init_weights()
+        if self.channels_last:
+            self.cnn.to(memory_format=torch.channels_last)  # after init_weights: the RNG stream and the initial values are unchanged
 
     def init_weights(self):
         for m in self.modules():
@@ -2032,7 +2040,13 @@ class ObjectDecoderCNN(nn.Module):
         x = x.view(-1, self.ch_feature_dim, self.fc_res, self.fc_res)
         z = self.from_latent(x)
         conv_in = z
-        out = self.cnn(conv_in).view(-1, self.num_chans, *self.patch_size)
+        if self.channels_last:
+            conv_in = conv_in.contiguous(memory_format=torch.channels_last)
+            out = self.cnn(conv_in).contiguous()  # back to standard NCHW: composite_fused requires contiguous inputs
+            self.channels_last_calls += 1
+        else:
+            out = self.cnn(conv_in)
+        out = out.view(-1, self.num_chans, *self.patch_size)
         out_a, out_rgb = torch.split(out, [1, out.shape[1] - 1], dim=1)
 
         rgb_func = torch.tanh if self.normalize_rgb else torch.sigmoid
@@ -5157,6 +5171,8 @@ class DLPDecoder(nn.Module):
 
                  # opt-in fused paste + alpha/depth composite (lpwm_stn/composite_autograd.py); False = original path
                  fused_composite=False,
+                 # opt-in: channels_last execution of the particle decoder CNN only (ObjectDecoderCNN); False = original
+                 particle_dec_channels_last=False,
                  ):
         """
         DLP Decoder Module
@@ -5240,10 +5256,16 @@ class DLPDecoder(nn.Module):
         self.init_conv_bg_std = init_conv_bg_std  # std for conv bg normal dist
 
         # object decoder
+        self.particle_dec_channels_last = bool(particle_dec_channels_last)
         if self.context_dim > 0 and self.decode_with_ctx:
             particle_dec_net = ObjectDecoderCNNFILM
+            if self.particle_dec_channels_last:
+                raise ValueError("particle_dec_channels_last=True is only supported for ObjectDecoderCNN, "
+                                 "not the context-conditioned ObjectDecoderCNNFILM")
+            layout_kwargs = {}
         else:
             particle_dec_net = ObjectDecoderCNN
+            layout_kwargs = {"channels_last": self.particle_dec_channels_last}
         self.particle_dec = particle_dec_net(patch_size=(self.obj_patch_size, self.obj_patch_size), num_chans=4,
                                              bottleneck_size=learned_feature_dim,
                                              use_resblock=self.use_resblock,
@@ -5254,7 +5276,8 @@ class DLPDecoder(nn.Module):
                                              mlp_hidden_dim=mlp_hidden_dim,
                                              init_zero_bias=init_zero_bias,
                                              init_conv_layers=init_conv_layers,
-                                             init_conv_fg_std=init_conv_fg_std
+                                             init_conv_fg_std=init_conv_fg_std,
+                                             **layout_kwargs
                                              )
 
         self.num_obj_upsample = self.particle_dec.num_upsample
@@ -5340,6 +5363,16 @@ class DLPDecoder(nn.Module):
                               return_alpha_masks):
         # same glimpses as get_objects_alpha_rgb, but paste + composite run in one fused kernel: the
         # per-particle [bs, n_kp, 4, im_size, im_size] canvas is never formed. Unsupported input -> ValueError.
+        # z_kp/obj_on/z_depth/z_scale can arrive as non-contiguous views (e.g. deterministic=True aliases mu_* straight
+        # from torch.chunk(), which is a view; training's reparameterize() masks this by producing a fresh tensor).
+        # Normalized here, at the opt-in path's own boundary, so the strict support check below sees the same
+        # logical values the reference path already tolerates, without loosening the check or the kernel's stride
+        # assumptions -- this fixes a caller-side layout gap, it does not touch fused_composite_supported/composite_fused.
+        z_kp = z_kp.contiguous()
+        obj_on = obj_on.contiguous()
+        z_depth = z_depth.contiguous()
+        if z_scale is not None:
+            z_scale = z_scale.contiguous()
         dec_objects = self.particle_dec(z_features, context=z_ctx)  # [bs * n_kp, 4, patch_size, patch_size]
         dec_objects = dec_objects.view(-1, z_kp.shape[1], *dec_objects.shape[1:])  # [bs, n_kp, 4, p, p]
         if translation is not None:

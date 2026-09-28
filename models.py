@@ -134,6 +134,8 @@ class DLP(nn.Module):
 
                  # opt-in fused paste + alpha/depth composite in the decoder; False keeps the original path
                  fused_composite=False,
+                 # opt-in: channels_last execution of the particle decoder CNN only; False keeps the original layout
+                 particle_dec_channels_last=False,
                  ):
         super(DLP, self).__init__()
         """
@@ -466,7 +468,8 @@ class DLP(nn.Module):
                                          init_conv_layers=init_conv_layers,  # initialize conv layers with normal dist
                                          init_conv_fg_std=init_conv_fg_std,  # std for conv fg normal dist
                                          init_conv_bg_std=init_conv_bg_std,  # std for conv bg normal dist
-                                         fused_composite=fused_composite
+                                         fused_composite=fused_composite,
+                                         particle_dec_channels_last=particle_dec_channels_last
                                          )
 
         # context (latent actions)
