@@ -3,7 +3,10 @@ Single-GPU training of DLPv3
 """
 # imports
 import numpy as np
+import hashlib
 import os
+import random
+import time
 from tqdm import tqdm
 import matplotlib
 import argparse
@@ -14,6 +17,7 @@ from torch.utils.data import DataLoader
 import torchvision.utils as vutils
 import torch.optim as optim
 # modules
+import lpwm_stn
 from models import DLP
 # datasets
 from datasets.get_dataset import get_image_dataset
@@ -37,6 +41,19 @@ def train_dlp(config_path='./configs/shapes.json'):
     except FileNotFoundError:
         raise SystemExit("config file not found")
     hparams = config  # to save a copy of the hyper-parameters
+    # optional keys; when absent the behaviour is exactly the previous one
+    seed = config.get('seed')  # fixes initial weights, data order and sampling noise
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    stn_backend = config.get('stn_backend')  # 'reference' (the default) or 'triton'
+    if stn_backend is not None:
+        lpwm_stn.set_backend(stn_backend)
+    fused_composite = bool(config.get('fused_composite', False))  # fused paste + composite in the decoder
+    particle_dec_channels_last = bool(config.get('particle_dec_channels_last', False))  # channels_last particle decoder CNN
+    log_step_timing = bool(config.get('log_step_timing', False))  # per-epoch step time and peak memory
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
@@ -121,8 +138,11 @@ def train_dlp(config_path='./configs/shapes.json'):
 
     # load data
     dataset = get_image_dataset(ds, root, mode='train', image_size=image_size)
+    loader_kwargs = {}
+    if seed is not None:
+        loader_kwargs['generator'] = torch.Generator().manual_seed(seed)  # same shuffling order in every run
     dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
-                            drop_last=True)
+                            drop_last=True, **loader_kwargs)
     # model
     model = DLP(
         cdim=ch,  # Number of input image channels
@@ -180,7 +200,9 @@ def train_dlp(config_path='./configs/shapes.json'):
         pint_enc_heads=pint_enc_heads,  # Number of PINT encoder attention heads
 
         # Dynamics configuration
-        timestep_horizon=1).to(device)
+        timestep_horizon=1,
+        fused_composite=fused_composite,
+        particle_dec_channels_last=particle_dec_channels_last).to(device)
     model_info = model.info()
     print(model_info)
     # prepare saving location
@@ -190,6 +212,14 @@ def train_dlp(config_path='./configs/shapes.json'):
     save_dir = os.path.join(log_dir, 'saves')
     save_config(log_dir, hparams)
     log_line(log_dir, model_info)
+    path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
+                 f" | seed: {seed} | log_step_timing: {log_step_timing}"
+                 f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}")
+    if seed is not None:  # lets separate runs prove they started from identical weights
+        weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
+        path_info += f" | init_weights_sha256: {weights_hash.hexdigest()[:16]}"
+    print(path_info)
+    log_line(log_dir, path_info + '\n')
     # save a backup of the code for this run
     backup_info = save_code_backup('.', backup_dir=os.path.join(log_dir, 'saves', 'code_backup'))
     log_line(log_dir, backup_info)
@@ -249,8 +279,13 @@ def train_dlp(config_path='./configs/shapes.json'):
     # iteration counter
     iteration = 0
 
+    log_step_timing = log_step_timing and device.type == 'cuda'
     for epoch in range(start_epoch, num_epochs):
         model.train()
+        if log_step_timing:
+            torch.cuda.reset_peak_memory_stats(device)
+            step_events = []
+            epoch_t0 = time.perf_counter()
         batch_losses = []
         batch_losses_rec = []
         batch_losses_kl = []
@@ -276,12 +311,37 @@ def train_dlp(config_path='./configs/shapes.json'):
             # reads the last batch's value; every other batch can skip materializing
             # the [bs, n_kp, 1, h, w] stack (see docs/stn_alpha_masks_api_plan.md)
             need_masks = plot_this_epoch and batch_idx == len(dataloader) - 1
+            if log_step_timing:
+                step_start = torch.cuda.Event(enable_timing=True)
+                step_start.record()
             model_output = model(x, warmup=warmup, with_loss=True, return_alpha_masks=need_masks,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func,
                                  beta_obj=beta_obj)
+            if iteration == 0:
+                # a config that asks for the fused path must actually take it (and only then)
+                fused_calls = model.decoder_module.fused_composite_calls
+                if fused_calls != int(fused_composite) or lpwm_stn.get_backend_name() != (stn_backend or lpwm_stn.get_backend_name()):
+                    raise RuntimeError(f"requested fused_composite={fused_composite}, stn_backend={stn_backend}, but the "
+                                       f"first step used fused_composite_calls={fused_calls}, "
+                                       f"backend={lpwm_stn.get_backend_name()}")
+                pd_net = model.decoder_module.particle_dec
+                cl_calls = getattr(pd_net, 'channels_last_calls', 0)
+                cl_weights_ok = all(m.weight.is_contiguous(memory_format=torch.channels_last)
+                                    for m in pd_net.modules() if isinstance(m, torch.nn.Conv2d))
+                if cl_calls != int(particle_dec_channels_last) or (particle_dec_channels_last and not cl_weights_ok):
+                    raise RuntimeError(f"requested particle_dec_channels_last={particle_dec_channels_last}, but the first step "
+                                       f"ran {cl_calls} channels_last particle_dec forward(s), "
+                                       f"conv weights channels_last: {cl_weights_ok}")
+                check_info = (f"path check (first step) ok: backend={lpwm_stn.get_backend_name()}, "
+                              f"fused_composite_calls={fused_calls}, "
+                              f"first_batch_sha256={hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:16]}, "
+                              f"first_step_loss={model_output['loss_dict']['loss'].item():.9f}, "
+                              f"particle_dec_channels_last_calls={cl_calls}")
+                print(check_info)
+                log_line(log_dir, check_info + '\n')
             # calculate loss
             all_losses = model_output['loss_dict']
             loss = all_losses['loss']
@@ -289,6 +349,10 @@ def train_dlp(config_path='./configs/shapes.json'):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if log_step_timing:
+                step_end = torch.cuda.Event(enable_timing=True)
+                step_end.record()
+                step_events.append((step_start, step_end))
 
             iteration += 1
 
@@ -349,6 +413,20 @@ def train_dlp(config_path='./configs/shapes.json'):
                              smu=mu_scale_mean.data.cpu().item())
             # break  # for debug
         pbar.close()
+        if log_step_timing:
+            torch.cuda.synchronize(device)
+            step_ms = sorted(a.elapsed_time(b) for a, b in step_events)
+            timing_info = (f"[step-timing] epoch={epoch} iters={len(step_ms)} median_ms={step_ms[len(step_ms) // 2]:.3f} "
+                           f"mean_ms={sum(step_ms) / len(step_ms):.3f} "
+                           f"peak_alloc_mb={torch.cuda.max_memory_allocated(device) / 1e6:.1f} "
+                           f"train_loss={np.mean(batch_losses):.6f} train_rec={np.mean(batch_losses_rec):.6f} "
+                           f"psnr={np.mean(batch_psnrs):.4f} "
+                           f"epoch_wall_s={time.perf_counter() - epoch_t0:.2f} "
+                           f"peak_reserved_mb={torch.cuda.max_memory_reserved(device) / 1e6:.1f} "
+                           f"reserved_now_mb={torch.cuda.memory_reserved(device) / 1e6:.1f}")
+            print(timing_info)
+            log_line(log_dir, timing_info + '\n')
+            del step_events
         losses.append(np.mean(batch_losses))
         losses_rec.append(np.mean(batch_losses_rec))
         losses_kl.append(np.mean(batch_losses_kl))
