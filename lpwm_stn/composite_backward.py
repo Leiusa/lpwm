@@ -53,7 +53,7 @@ _ST_EPS = 1.0e-9
 # product separately rounded.  Triton's own codegen contracts a*b + c*d into
 # fma.rn.f32, which drops the intermediate rounding and diverges by 2 ULP.
 # Emitting the PTX directly reproduces the reference rounding exactly.
-_RGB_TOTAL_ASM: tl.constexpr = """{
+_RGB_TOTAL_ASM = tl.constexpr("""{
     .reg .f32 %t0, %t1, %t2;
     mul.rn.f32 %t0, $1, $2;
     mul.rn.f32 %t0, %t0, $3;
@@ -63,7 +63,7 @@ _RGB_TOTAL_ASM: tl.constexpr = """{
     mul.rn.f32 %t2, %t2, $7;
     add.rn.f32 $0, %t0, %t1;
     add.rn.f32 $0, $0, %t2;
-}"""
+}""")
 
 
 # --- Exact FP32 dL_dimp primitives ---------------------------------------
@@ -71,9 +71,9 @@ _RGB_TOTAL_ASM: tl.constexpr = """{
 # not.  Emitting div.rn.f32 directly keeps both the rounding and the denormal
 # behaviour.  _sub_prod exists because `acc += -x*y` is contracted into
 # fma.rn.f32, which drops the intermediate rounding of the product.
-_DIV_RN_ASM: tl.constexpr = """{
+_DIV_RN_ASM = tl.constexpr("""{
     div.rn.f32 $0, $1, $2;
-}"""
+}""")
 
 
 @triton.jit
@@ -84,11 +84,11 @@ def _div_rn(x, y):
         dtype=tl.float32, is_pure=True, pack=1)
 
 
-_SUB_PROD_ASM: tl.constexpr = """{
+_SUB_PROD_ASM = tl.constexpr("""{
     .reg .f32 %t;
     mul.rn.f32 %t, $2, $3;
     sub.rn.f32 $0, $1, %t;
-}"""
+}""")
 
 
 @triton.jit
@@ -105,12 +105,12 @@ def _sub_prod(acc, x, y):
 # fma.rn.f32, and the leading `tl.zeros +` add additionally turns a -0.0 product
 # into +0.0.  Assigning the completed node from explicit PTX reproduces the
 # reference bit-for-bit, signed zeros included.
-_MK_BG_ASM: tl.constexpr = """{
+_MK_BG_ASM = tl.constexpr("""{
     .reg .f32 %t0, %t1;
     mul.rn.f32 %t0, $1, $2;
     mul.rn.f32 %t1, $1, $3;
     sub.rn.f32 $0, %t0, %t1;
-}"""
+}""")
 
 
 @triton.jit
