@@ -34,6 +34,25 @@ torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
 
 
+def compile_for_training(model, mode):
+    """torch.compile the TRAINING forward pass only (opt-in config key `torch_compile`).
+
+    The custom Triton STN crop/paste and fused-composite ops are kept out of the traced graph with
+    torch.compiler.disable: Dynamo cannot trace their launchers (it passes symbolic strides into the hand-written
+    kernel launch and fails), so they run exactly as in eager while everything around them is compiled.
+    Validation, plotting and checkpoints keep using the uncompiled `model` (same parameters, unchanged state_dict keys).
+    """
+    import lpwm_stn.triton_backend as tb
+    import modules.modules as mm
+    for mod, name in ((tb, 'stn_crop'), (tb, 'stn_paste'), (mm, 'composite_fused')):
+        fn = getattr(mod, name, None)
+        if fn is not None and not getattr(fn, '_lpwm_compile_disabled', False):
+            wrapped = torch.compiler.disable(fn)
+            wrapped._lpwm_compile_disabled = True
+            setattr(mod, name, wrapped)
+    return torch.compile(model) if mode == 'default' else torch.compile(model, mode=mode)
+
+
 def train_dlp(config_path='./configs/shapes.json'):
     # load config
     try:
@@ -54,6 +73,9 @@ def train_dlp(config_path='./configs/shapes.json'):
     fused_composite = bool(config.get('fused_composite', False))  # fused paste + composite in the decoder
     particle_dec_channels_last = bool(config.get('particle_dec_channels_last', False))  # channels_last particle decoder CNN
     log_step_timing = bool(config.get('log_step_timing', False))  # per-epoch step time and peak memory
+    # torch.compile of the training forward: false/absent = eager (default), true or "default", "reduce-overhead", ...
+    torch_compile = config.get('torch_compile', False)
+    compile_mode = None if torch_compile in (False, None) else ('default' if torch_compile is True else str(torch_compile))
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
@@ -214,7 +236,9 @@ def train_dlp(config_path='./configs/shapes.json'):
     log_line(log_dir, model_info)
     path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
                  f" | seed: {seed} | log_step_timing: {log_step_timing}"
-                 f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}")
+                 f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}"
+                 f" | torch_compile: {compile_mode}")
+    train_model = model if compile_mode is None else compile_for_training(model, compile_mode)
     if seed is not None:  # lets separate runs prove they started from identical weights
         weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
         path_info += f" | init_weights_sha256: {weights_hash.hexdigest()[:16]}"
@@ -314,7 +338,9 @@ def train_dlp(config_path='./configs/shapes.json'):
             if log_step_timing:
                 step_start = torch.cuda.Event(enable_timing=True)
                 step_start.record()
-            model_output = model(x, warmup=warmup, with_loss=True, return_alpha_masks=need_masks,
+            if compile_mode == 'reduce-overhead':
+                torch.compiler.cudagraph_mark_step_begin()  # CUDA graphs: a new training iteration starts
+            model_output = train_model(x, warmup=warmup, with_loss=True, return_alpha_masks=need_masks,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
