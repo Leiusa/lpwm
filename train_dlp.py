@@ -28,29 +28,11 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
                              plot_training_metrics, save_metrics_data, save_code_backup)
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
+from utils.compile_utils import compile_for_training, compile_mode_from_config
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
-
-
-def compile_for_training(model, mode):
-    """torch.compile the TRAINING forward pass only (opt-in config key `torch_compile`).
-
-    The custom Triton STN crop/paste and fused-composite ops are kept out of the traced graph with
-    torch.compiler.disable: Dynamo cannot trace their launchers (it passes symbolic strides into the hand-written
-    kernel launch and fails), so they run exactly as in eager while everything around them is compiled.
-    Validation, plotting and checkpoints keep using the uncompiled `model` (same parameters, unchanged state_dict keys).
-    """
-    import lpwm_stn.triton_backend as tb
-    import modules.modules as mm
-    for mod, name in ((tb, 'stn_crop'), (tb, 'stn_paste'), (mm, 'composite_fused')):
-        fn = getattr(mod, name, None)
-        if fn is not None and not getattr(fn, '_lpwm_compile_disabled', False):
-            wrapped = torch.compiler.disable(fn)
-            wrapped._lpwm_compile_disabled = True
-            setattr(mod, name, wrapped)
-    return torch.compile(model) if mode == 'default' else torch.compile(model, mode=mode)
 
 
 def train_dlp(config_path='./configs/shapes.json'):
@@ -74,8 +56,7 @@ def train_dlp(config_path='./configs/shapes.json'):
     particle_dec_channels_last = bool(config.get('particle_dec_channels_last', False))  # channels_last particle decoder CNN
     log_step_timing = bool(config.get('log_step_timing', False))  # per-epoch step time and peak memory
     # torch.compile of the training forward: false/absent = eager (default), true or "default", "reduce-overhead", ...
-    torch_compile = config.get('torch_compile', False)
-    compile_mode = None if torch_compile in (False, None) else ('default' if torch_compile is True else str(torch_compile))
+    compile_mode = compile_mode_from_config(config)
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
