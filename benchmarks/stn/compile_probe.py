@@ -58,6 +58,9 @@ def main():
                     help="keep the custom Triton ops out of the compiled graph: wrap lpwm_stn.triton_backend.stn_crop/stn_paste "
                          "and modules.modules.composite_fused with torch.compiler.disable (after the eager baseline, before "
                          "explain). No repository file changes; the reference backend is not touched.")
+    ap.add_argument("--mode", default="default", help="torch.compile mode: default | reduce-overhead (CUDA graphs) | ...")
+    ap.add_argument("--skip-hw-check", action="store_true",
+                    help="do not require the milestone-1 study GPU (M1_EXPECTED_GPU); the GPU is still recorded")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -74,7 +77,11 @@ def main():
     from datasets.get_dataset import get_image_dataset
     from utils.loss_functions import LossLPIPS
 
-    hw = MC.verify_hardware()
+    if args.skip_hw_check:
+        hw = {"verified": "skipped", "gpu": torch.cuda.get_device_name(0), "capability": list(torch.cuda.get_device_capability(0)),
+              "node": os.uname().nodename}
+    else:
+        hw = MC.verify_hardware()
     MC.assert_agreed_environment(MC.set_agreed_environment())
     B, seed, path = args.batch_size, args.seed, args.path
     backend = "triton" if path == "fused_cl" else "reference"
@@ -90,7 +97,7 @@ def main():
                            "dynamo_suppress_errors": torch._dynamo.config.suppress_errors,
                            "inline_inbuilt_nn_modules": getattr(torch._dynamo.config, "inline_inbuilt_nn_modules", None)},
               "env": {k: os.environ.get(k) for k in ("TORCH_LOGS", "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "SLURM_JOB_ID")},
-              "compile_call": "cmodel = torch.compile(model)   # default mode, fullgraph=False, dynamic=None",
+              "compile_call": f"cmodel = torch.compile(model{'' if args.mode == 'default' else f', mode={args.mode!r}'})   # fullgraph=False, dynamic=None",
               "phases": {}, "date_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
 
     def save():
@@ -241,7 +248,7 @@ def main():
     print(f"[explain] {ex_rec['status']} | graphs {ex_rec.get('graph_count')} | graph breaks {ex_rec.get('graph_break_count')}", flush=True)
 
     # 3. the probe itself
-    cmodel = torch.compile(model)
+    cmodel = torch.compile(model) if args.mode == "default" else torch.compile(model, mode=args.mode)
     run_phase("compiled", cmodel, None, args.timed_steps, settle=args.settle_steps, max_warm=args.max_compiled_warmup_steps)
 
     # 4. eager again (drift check)
