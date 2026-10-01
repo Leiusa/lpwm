@@ -40,11 +40,19 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--repo-root", required=True)
     ap.add_argument("--config", required=True)
-    ap.add_argument("--eval-json", required=True, help="seed's eval_m1.json (gives ckpt paths + fixed_batch_indices)")
+    ap.add_argument("--eval-json", default=None, help="milestone-1 mode: seed's eval_m1.json (ckpt paths + fixed_batch_indices)")
+    ap.add_argument("--ckpt-a", default=None, help="any-checkpoint mode: first checkpoint (left column of each pair)")
+    ap.add_argument("--ckpt-b", default=None, help="any-checkpoint mode: second checkpoint")
+    ap.add_argument("--path-a", default="fused_cl", choices=("reference", "fused_cl"), help="inference path for --ckpt-a")
+    ap.add_argument("--path-b", default="fused_cl", choices=("reference", "fused_cl"), help="inference path for --ckpt-b")
+    ap.add_argument("--labels", default=None, help="column labels 'X,Y' (default A,D in milestone-1 mode, a,b otherwise)")
+    ap.add_argument("--skip-hw-check", action="store_true", help="do not require the milestone-1 study GPU; the GPU is recorded")
     ap.add_argument("--out", required=True)
     ap.add_argument("--n-images", type=int, default=16)
     ap.add_argument("--seed", type=int, default=None, help="only for the figure title; eval_m1.json does not record it")
     args = ap.parse_args(argv)
+    if (args.eval_json is None) == (args.ckpt_a is None or args.ckpt_b is None):
+        ap.error("give either --eval-json, or both --ckpt-a and --ckpt-b")
 
     repo = os.path.abspath(args.repo_root)
     sys.path.insert(0, os.path.join(repo, "benchmarks", "stn"))
@@ -60,22 +68,36 @@ def main(argv=None):
     from datasets.get_dataset import get_image_dataset
     from utils.util_func import plot_keypoints_on_image
 
-    ev = json.load(open(args.eval_json))
-    idx = ev["fixed_batch_indices"][: args.n_images]
-    ckpts = {"A": ev["checkpoints"]["A"]["path"], "D": ev["checkpoints"]["D"]["path"]}
+    PATH_FLAGS = {"reference": dict(stn_backend="reference", fused_composite=False, particle_dec_channels_last=False),
+                  "fused_cl": dict(stn_backend="triton", fused_composite=True, particle_dec_channels_last=True)}
+    if args.eval_json:
+        ev = json.load(open(args.eval_json))
+        idx = ev["fixed_batch_indices"][: args.n_images]
+        ckpts = {"A": ev["checkpoints"]["A"]["path"], "D": ev["checkpoints"]["D"]["path"]}
+        SPECS = {"A": PATH_FLAGS["reference"], "D": PATH_FLAGS["fused_cl"]}
+        labels = (args.labels or "A,D").split(",")
+    else:
+        idx = None
+        ckpts = {"A": args.ckpt_a, "D": args.ckpt_b}
+        SPECS = {"A": PATH_FLAGS[args.path_a], "D": PATH_FLAGS[args.path_b]}
+        labels = (args.labels or "a,b").split(",")
+    lab = {"A": labels[0], "D": labels[1]}
     for k, p in ckpts.items():
         if not os.path.exists(p):
             raise FileNotFoundError(f"checkpoint {k} missing on disk: {p}")
 
-    hw = MC.verify_hardware()
+    if args.skip_hw_check:
+        hw = {"nvidia_smi": [{"name": torch.cuda.get_device_name(0)}], "node": os.uname().nodename}
+    else:
+        hw = MC.verify_hardware()
     MC.set_agreed_environment()
     base_cfg = json.load(open(args.config))
     ds = get_image_dataset(base_cfg["ds"], base_cfg["root"], mode="valid", image_size=base_cfg["image_size"])
+    if idx is None:   # the same fixed images the milestone-1 study used (spread over episodes, deterministic)
+        import train_dlp_compare as C
+        _, idx = C.fixed_validation_batch(ds, args.n_images)
     x = torch.stack([ds[i][0] for i in idx])
     x = x.reshape(-1, *x.shape[-3:])[: len(idx)].cuda()  # same reshape train_dlp_compare.fixed_validation_batch uses
-
-    SPECS = {"A": dict(stn_backend="reference", fused_composite=False, particle_dec_channels_last=False),
-             "D": dict(stn_backend="triton", fused_composite=True, particle_dec_channels_last=True)}
     out = {}
     for which, flags in SPECS.items():
         cfg = dict(base_cfg)
@@ -116,9 +138,9 @@ def main(argv=None):
         del model
         torch.cuda.empty_cache()
 
-    cols = [("GT", None, None), ("A recon", "A", "rec"), ("D recon", "D", "rec"), ("A foreground", "A", "fg"),
-            ("D foreground", "D", "fg"), ("A background", "A", "bg"), ("D background", "D", "bg"),
-            ("A mask", "A", "mask"), ("D mask", "D", "mask"), ("A particles", "A", "particles"), ("D particles", "D", "particles")]
+    cols = [("GT", None, None)]
+    for key, name in (("rec", "recon"), ("fg", "foreground"), ("bg", "background"), ("mask", "mask"), ("particles", "particles")):
+        cols += [(f"{lab['A']} {name}", "A", key), (f"{lab['D']} {name}", "D", key)]
     n = x.shape[0]
     fig, axes = plt.subplots(n, len(cols), figsize=(1.5 * len(cols), 1.5 * n), dpi=110)
     for r in range(n):
@@ -142,7 +164,7 @@ def main(argv=None):
             if c == 0:
                 ax.set_ylabel(f"val#{idx[r]}", fontsize=8)
     fig.suptitle(f"seed {args.seed if args.seed is not None else '?'} | {hw['nvidia_smi'][0]['name']} node {hw['node']} | "
-                 f"A={os.path.basename(ckpts['A'])} D={os.path.basename(ckpts['D'])} | particle slots (n_kp_enc)="
+                 f"{lab['A']}={os.path.basename(ckpts['A'])} {lab['D']}={os.path.basename(ckpts['D'])} | particle slots (n_kp_enc)="
                  f"{out['A']['n_kp_enc']} | 'used' = obj_on (Beta-posterior mean) > 0.5", fontsize=9)
     fig.tight_layout(rect=[0, 0, 1, 0.97])
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
@@ -151,7 +173,8 @@ def main(argv=None):
 
     counts_path = os.path.splitext(args.out)[0] + "_particle_counts.json"
     json.dump({"seed": args.seed, "n_kp_enc": out["A"]["n_kp_enc"], "val_indices": idx,
-              "n_active": {"A": out["A"]["n_active"], "D": out["D"]["n_active"]}}, open(counts_path, "w"), indent=1)
+              "checkpoints": {lab["A"]: ckpts["A"], lab["D"]: ckpts["D"]},
+              "n_active": {lab["A"]: out["A"]["n_active"], lab["D"]: out["D"]["n_active"]}}, open(counts_path, "w"), indent=1)
     print("wrote", counts_path)
 
 
