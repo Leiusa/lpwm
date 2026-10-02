@@ -60,6 +60,10 @@ def train_ddlp(config_path='./configs/balls.json'):
     particle_dec_channels_last = bool(config.get('particle_dec_channels_last', False))  # channels_last particle decoder CNN
     log_step_timing = bool(config.get('log_step_timing', False)) and device.type == 'cuda'  # per-epoch step time/memory
     compile_mode = compile_mode_from_config(config)  # torch.compile of the training forward (see utils/compile_utils.py)
+    # TF32 tensor cores for fp32 matmul/linear (a precision change; cuDNN convs already use TF32 by torch default)
+    tf32_matmul = bool(config.get('tf32_matmul', False))
+    if tf32_matmul:
+        torch.backends.cuda.matmul.allow_tf32 = True
     max_steps_per_epoch = config.get('max_steps_per_epoch')  # cap training steps per epoch (short runs); None = all
 
     # data and general
@@ -292,7 +296,8 @@ def train_ddlp(config_path='./configs/balls.json'):
     # which optimized path this run actually uses (checked again after the first step)
     path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
                  f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}"
-                 f" | torch_compile: {compile_mode} | seed: {seed} | log_step_timing: {log_step_timing}"
+                 f" | torch_compile: {compile_mode} | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"
+                 f" | seed: {seed} | log_step_timing: {log_step_timing}"
                  f" | max_steps_per_epoch: {max_steps_per_epoch}")
     if seed is not None:  # lets separate runs prove they started from identical weights
         weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
@@ -437,10 +442,13 @@ def train_ddlp(config_path='./configs/balls.json'):
                 if (cl_calls > 0) != particle_dec_channels_last or (particle_dec_channels_last and not cl_weights_ok):
                     problems.append(f"channels_last_calls={cl_calls}, weights channels_last={cl_weights_ok} "
                                     f"(requested {particle_dec_channels_last})")
+                if tf32_matmul and not torch.backends.cuda.matmul.allow_tf32:
+                    problems.append("matmul TF32 is off (requested tf32_matmul=True)")
                 if problems:
                     raise RuntimeError("requested optimization path not in effect: " + "; ".join(problems))
                 check_info = (f"path check (first step) ok: backend={lpwm_stn.get_backend_name()}, "
                               f"fused_composite_calls={fused_calls}, particle_dec_channels_last_calls={cl_calls}, "
+                              f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}, "
                               f"first_batch_sha256={hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:16]}, "
                               f"first_step_loss={model_output['loss_dict']['loss'].item():.9f}")
                 print(check_info)
