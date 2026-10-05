@@ -49,6 +49,12 @@ def parse_override(s):
     return k, v
 
 
+def is_annotation(name):
+    # the mod:: record_function scopes are mirrored on the GPU timeline as user annotations spanning the whole module
+    # (they show up among device events); they are not kernels
+    return name.startswith("mod::")
+
+
 def kernel_category(name):
     n = name.lower()
     if "_stn_" in n or "composite" in n or "stn_crop" in n or "stn_paste" in n:
@@ -217,6 +223,8 @@ def main():
     # forward kernels attributed to module scopes (kernels launched by any op inside the module's forward)
     def scope_kernels(ev, acc):
         for k in getattr(ev, "kernels", []) or []:
+            if is_annotation(k.name):
+                continue
             acc[kernel_category(k.name)] += k.duration
         for ch in ev.cpu_children:
             scope_kernels(ch, acc)
@@ -232,7 +240,7 @@ def main():
     kernels = defaultdict(float)
     for e in prof.events():
         dev = getattr(e, "device_type", None)
-        if dev is not None and "CUDA" in str(dev):
+        if dev is not None and "CUDA" in str(dev) and not is_annotation(e.name):
             t = getattr(e, "device_time", None) or getattr(e, "cuda_time", 0.0) or 0.0
             cats[kernel_category(e.name)] += t
             kernels[e.name] += t
@@ -377,6 +385,8 @@ def backward_by_module(prof, n_steps):
 
     def subtree_kernels(e, acc):
         for k in getattr(e, "kernels", []) or []:
+            if is_annotation(k.name):
+                continue
             acc[kernel_category(k.name)] += k.duration
         for ch in e.cpu_children:
             subtree_kernels(ch, acc)
