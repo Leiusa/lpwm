@@ -263,7 +263,7 @@ class DLP(nn.Module):
         self.kp_activation = 'tanh'  # since keypoints are in [-1, 1], we use tanh activation for kp heads
         self.anchor_s = anchor_s  # posterior patch ratio, i.e., anchor size, glimpse-size = anchor_s * image_size
         self.patch_size = patch_size  # prior patch size, to propose prior keypoints
-        self.obj_patch_size = np.round(self.anchor_s * (image_size - 1)).astype(int)
+        self.obj_patch_size = int(np.round(self.anchor_s * (image_size - 1)))  # plain int: torch.compile turns NumPy ints into tensors
         self.mask_bg_in_enc = mask_bg_in_enc  # before encoding the bg, mask with the particles' obj_on
 
         self.features_dist = features_dist

@@ -52,7 +52,8 @@ __all__ = [
 def affine_grid_sample(x, theta, out_dims: Tuple[int, int, int, int], mode: str, align_corners: bool = False,
                        padding_mode: str = 'zeros'):
     # construct sampling grid
-    grid = F.affine_grid(theta, torch.Size(out_dims), align_corners=align_corners)
+    grid = F.affine_grid(theta, [out_dims[0], out_dims[1], out_dims[2], out_dims[3]],  # List[int]: Dynamo cannot trace torch.Size(...)
+                         align_corners=align_corners)
     # sample image from grid
     return F.grid_sample(x, grid, align_corners=align_corners, mode=mode, padding_mode=padding_mode)
 
