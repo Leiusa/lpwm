@@ -15,8 +15,13 @@ warmup=False, return_alpha_masks=False) eagerly for --warmup + --steps steps, th
                                matmul/linear, attention, the custom Triton STN / composite kernels, grid_sample,
                                elementwise/other (forward + backward + optimizer together)
 
-Backward is reported as a whole (module-level backward timing is not attempted: several LPWM modules return dicts,
-which module backward hooks do not cover). Use --override key=value to change config entries (e.g. particle count:
+  5. per-module BACKWARD time  GPU kernel time of every autograd node evaluated in backward, attributed to the module
+                               whose forward created that node (profiler sequence numbers link a backward node to the
+                               forward op that recorded it; that op's mod:: scopes give the module). Kernel time, not
+                               wall time; nested modules are included in their parents; nodes created outside every
+                               timed module (top-level losses, AccumulateGrad) are listed as unattributed.
+
+Use --override key=value to change config entries (e.g. particle count:
 n_kp_per_patch=2 -> 512 prior particles with patch_size 8 at 128x128), --tf32-matmul to allow TF32 for matmul
 (a precision change, measured only when asked).
 
@@ -221,6 +226,7 @@ def main():
         if e.name.startswith("mod::"):
             scope_kernels(e, module_cats[e.name[5:]])
     module_cats = {m: {c: v / 1e3 / args.profile_steps for c, v in cs.items()} for m, cs in module_cats.items()}
+    bwd_cats, bwd_cover = ({}, {}) if args.compile else backward_by_module(prof, args.profile_steps)
 
     cats = defaultdict(float)
     kernels = defaultdict(float)
@@ -263,8 +269,21 @@ def main():
     for name, sign in (("encoder_module", 1), ("encoder_module.ctx_enc", -1), ("decoder_module", 1)):
         for c, v in module_cats.get(name, {}).items():
             dlp_cats[c] += sign * v
+    bwd = {n: sum(cs.values()) for n, cs in bwd_cats.items()}
+    if bwd:
+        split["backward_kernel_ms_per_step"] = {
+            k: v for k, v in zip(split["forward_ms_per_step"],
+                                 (bwd.get("encoder_module", 0.0) - bwd.get("encoder_module.ctx_enc", 0.0) + bwd.get("decoder_module", 0.0),
+                                  sum(bwd.get(n, 0.0) for n in lpwm_specific), bwd.get("loss: LossLPIPS (vgg)", 0.0)))}
     result["dlp_vs_lpwm_split"] = split
     result["dlp_forward_kernel_categories"] = dict(dlp_cats)
+    result["backward_kernel_categories_by_module"] = bwd_cats
+    result["backward_attribution_coverage"] = bwd_cover
+    if args.compile:
+        from torch._dynamo.utils import counters
+        result["dynamo"] = {"unique_graphs": int(counters["stats"].get("unique_graphs", 0)),
+                            "graph_breaks": int(sum(counters["graph_break"].values())),
+                            "graph_break_reasons": {k[:300]: int(v) for k, v in counters["graph_break"].most_common(20)}}
     json.dump(result, open(os.path.join(args.out, "lpwm_profile.json"), "w"), indent=1)
 
     s = result["step_split_median_ms"]
@@ -274,9 +293,14 @@ def main():
     print(f"step {s['step_ms']:.1f} ms = forward {s['forward_ms']:.1f} + backward {s['backward_ms']:.1f} + optimizer "
           f"{s['optimizer_ms']:.1f} | peak allocated {peak_alloc / 1e3:.1f} GB")
     if args.compile:
-        print("(compiled step: per-module timing skipped, module boundaries are fused)")
+        d = result["dynamo"]
+        print(f"(compiled step: per-module timing skipped, module boundaries are fused) | dynamo: {d['unique_graphs']} "
+              f"graphs, {d['graph_breaks']} graph breaks")
+        for k, v in list(d["graph_break_reasons"].items())[:8]:
+            print(f"   {v:4d} x {k[:150]}")
     else:
         print_module_tables(modules, split, s, dlp_cats, module_cats)
+        print_backward_tables(modules, module_cats, bwd_cats, bwd_cover, split)
     print_kernel_tables(categories, top_kernels, args.out)
     return 0
 
@@ -305,6 +329,113 @@ def print_module_tables(modules, split, s, dlp_cats, module_cats):
         if sum(cs.values()) < 0.5:
             continue
         print(f"{name[:52]:52s} " + " ".join(f"{cs.get(c, 0.0):8.1f}" for c in order))
+
+
+BWD_ROOT = "autograd::engine::evaluate_function"
+
+
+def backward_by_module(prof, n_steps):
+    """Backward GPU kernel time per module (ms per step, by kernel category) + how much of it could be attributed."""
+    events = prof.events()
+
+    def under_backward(e):
+        while e is not None:
+            if e.name.startswith(BWD_ROOT):
+                return True
+            e = e.cpu_parent
+        return False
+
+    def scopes(e):
+        out = []
+        while e is not None:
+            if e.name.startswith("mod::"):
+                out.append(e.name[5:])
+            e = e.cpu_parent
+        return out
+
+    # forward: sequence number -> module scopes of the op that created the autograd node. Ops that create no node
+    # (no grad needed) peek the same number as the next node-creating op, possibly in another module; the creating op
+    # (or one nested in it) is the LAST to start with that number, so the latest-starting op wins.
+    fwd = {}
+    for e in events:
+        seq = getattr(e, "sequence_nr", -1)
+        if seq is None or seq < 0 or e.name.startswith(BWD_ROOT) or under_backward(e):
+            continue
+        t = e.time_range.start
+        if seq not in fwd or t >= fwd[seq][0]:
+            fwd[seq] = (t, scopes(e))
+
+    def node_seq(e):
+        stack = [e]
+        while stack:
+            x = stack.pop(0)
+            seq = getattr(x, "sequence_nr", -1)
+            if seq is not None and seq >= 0:
+                return seq
+            stack.extend(x.cpu_children)
+        return -1
+
+    def subtree_kernels(e, acc):
+        for k in getattr(e, "kernels", []) or []:
+            acc[kernel_category(k.name)] += k.duration
+        for ch in e.cpu_children:
+            subtree_kernels(ch, acc)
+
+    by_mod = defaultdict(lambda: defaultdict(float))
+    cover = {"backward_kernel_ms_per_step": 0.0, "attributed_to_a_module_ms": 0.0, "unattributed_ms": 0.0,
+             "nodes": 0, "nodes_without_forward_match": 0}
+    unattributed = defaultdict(float)
+    for e in events:
+        if not e.name.startswith(BWD_ROOT) or under_backward(e.cpu_parent):
+            continue
+        acc = defaultdict(float)
+        subtree_kernels(e, acc)
+        ms = sum(acc.values()) / 1e3 / n_steps
+        cover["backward_kernel_ms_per_step"] += ms
+        cover["nodes"] += 1
+        seq = node_seq(e)
+        mods = fwd.get(seq, (0, []))[1] if seq >= 0 else []
+        if seq < 0 or seq not in fwd:
+            cover["nodes_without_forward_match"] += 1
+        if not mods:
+            cover["unattributed_ms"] += ms
+            unattributed[e.name[len(BWD_ROOT) + 2:].split(" ")[0][:60]] += ms
+            continue
+        cover["attributed_to_a_module_ms"] += ms
+        for m in mods:
+            for c, v in acc.items():
+                by_mod[m][c] += v / 1e3 / n_steps
+    cover["nodes"] //= n_steps
+    cover["nodes_without_forward_match"] //= n_steps
+    cover["unattributed_top_nodes_ms"] = dict(sorted(unattributed.items(), key=lambda kv: -kv[1])[:10])
+    return {m: dict(cs) for m, cs in by_mod.items()}, cover
+
+
+def print_backward_tables(modules, fwd_cats, bwd_cats, cover, split):
+    if not bwd_cats:
+        print("\n-- backward by module: nothing attributed (profiler events carry no sequence numbers?)")
+        return
+    print(f"\n-- backward GPU kernel time per module (attributed via autograd sequence numbers; nested modules are "
+          f"included in their parents)")
+    print(f"   coverage: {cover['backward_kernel_ms_per_step']:.1f} ms backward kernel time/step, "
+          f"{cover['attributed_to_a_module_ms']:.1f} ms attributed to a module, {cover['unattributed_ms']:.1f} ms "
+          f"unattributed; {cover['nodes']} nodes/step, {cover['nodes_without_forward_match']} without a forward match")
+    for k, v in list(cover["unattributed_top_nodes_ms"].items())[:5]:
+        print(f"     unattributed {v:7.1f} ms  {k}")
+    short = {"convolution": "conv", "matmul / linear": "matmul", "elementwise / reduction / other": "elemwise",
+             "custom triton (STN / composite)": "triton", "grid_sample (reference STN)": "grid_smp", "attention": "attn"}
+    print(f"{'module':52s} {'fwd ms':>8s} {'bwd ms':>8s} {'bwd/fwd':>7s} " + " ".join(f"{v:>8s}" for v in short.values()))
+    for name, cs in sorted(bwd_cats.items(), key=lambda kv: -sum(kv[1].values())):
+        b = sum(cs.values())
+        if b < 0.5:
+            continue
+        f = sum(fwd_cats.get(name, {}).values())
+        print(f"{name[:52]:52s} {f:8.1f} {b:8.1f} {b / f if f else float('nan'):7.2f} " +
+              " ".join(f"{cs.get(c, 0.0):8.1f}" for c in short))
+    if "backward_kernel_ms_per_step" in split:
+        print("\n-- backward split: DLP vs LPWM-specific (GPU kernel ms per step)")
+        for k, v in split["backward_kernel_ms_per_step"].items():
+            print(f"{k:60s} {v:8.1f} ms")
 
 
 def print_kernel_tables(categories, top_kernels, out):
