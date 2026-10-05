@@ -82,6 +82,12 @@ def main():
     ap.add_argument("--depth", type=int, default=2, help="module name depth to time (1 = encoder_module, 2 = encoder_module.x)")
     ap.add_argument("--override", action="append", default=[], help="config key=value (JSON value), repeatable")
     ap.add_argument("--tf32-matmul", action="store_true", help="allow TF32 for matmul (precision change)")
+    ap.add_argument("--cudnn-benchmark", action="store_true",
+                    help="cudnn.benchmark=True: time the candidate conv algorithms per shape, keep the fastest "
+                         "(default False, as train_lpwm.py)")
+    ap.add_argument("--cudnn-nondeterministic", action="store_true",
+                    help="cudnn.deterministic=False: also allow conv algorithms whose results vary run to run at "
+                         "rounding level (default True, as train_lpwm.py)")
     ap.add_argument("--compile", default=None, metavar="MODE",
                     help="profile the torch.compile'd training step (utils/compile_utils.compile_for_training, MODE = "
                          "default | reduce-overhead). Per-module timing is skipped (module boundaries are fused); step "
@@ -99,8 +105,8 @@ def main():
     from datasets.get_dataset import get_video_dataset
     from utils.loss_functions import LossLPIPS
 
-    torch.backends.cudnn.benchmark = False      # as train_lpwm.py
-    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = args.cudnn_benchmark                 # train_lpwm.py: False
+    torch.backends.cudnn.deterministic = not args.cudnn_nondeterministic  # train_lpwm.py: True
     if args.tf32_matmul:
         torch.backends.cuda.matmul.allow_tf32 = True
     os.makedirs(args.out, exist_ok=True)
@@ -252,6 +258,7 @@ def main():
     prof.export_chrome_trace(os.path.join(args.out, "trace.json"))
 
     result = {"config": os.path.abspath(args.config), "overrides": args.override, "tf32_matmul": args.tf32_matmul,
+              "cudnn_benchmark": torch.backends.cudnn.benchmark, "cudnn_deterministic": torch.backends.cudnn.deterministic,
               "gpu": torch.cuda.get_device_name(0), "torch": torch.__version__, "stn_backend": lpwm_stn.get_backend_name(),
               "fused_composite": bool(cfg.get("fused_composite", False)),
               "particle_dec_channels_last": bool(cfg.get("particle_dec_channels_last", False)),
@@ -296,7 +303,8 @@ def main():
 
     s = result["step_split_median_ms"]
     print(f"== {result['gpu']} | backend={result['stn_backend']} fused={result['fused_composite']} cl={result['particle_dec_channels_last']} "
-          f"tf32_matmul={args.tf32_matmul} compile={args.compile} | batch {cfg['batch_size']} x {T + 1} frames | particles: "
+          f"tf32_matmul={args.tf32_matmul} cudnn_benchmark={torch.backends.cudnn.benchmark} "
+          f"cudnn_deterministic={torch.backends.cudnn.deterministic} compile={args.compile} | batch {cfg['batch_size']} x {T + 1} frames | particles: "
           f"prior {model.n_kp_prior}, encoder {model.n_kp_enc}, decoder {model.n_kp_dec} | overrides {args.override}")
     print(f"step {s['step_ms']:.1f} ms = forward {s['forward_ms']:.1f} + backward {s['backward_ms']:.1f} + optimizer "
           f"{s['optimizer_ms']:.1f} | peak allocated {peak_alloc / 1e3:.1f} GB")

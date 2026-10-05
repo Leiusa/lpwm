@@ -16,7 +16,8 @@ ap.add_argument("--top", type=int, default=30)
 a = ap.parse_args()
 r = json.load(open(a.json))
 s = r["step_split_median_ms"]
-print(f"{r['gpu']} | tf32_matmul={r['tf32_matmul']} | step {s['step_ms']:.1f} = fwd {s['forward_ms']:.1f} + bwd "
+print(f"{r['gpu']} | tf32_matmul={r['tf32_matmul']} cudnn_benchmark={r.get('cudnn_benchmark', False)} "
+      f"cudnn_deterministic={r.get('cudnn_deterministic', True)} | step {s['step_ms']:.1f} = fwd {s['forward_ms']:.1f} + bwd "
       f"{s['backward_ms']:.1f} + opt {s['optimizer_ms']:.1f} ms (CUDA events, median)")
 c = r.get("backward_attribution_coverage", {})
 if c:
