@@ -82,7 +82,7 @@ def main():
         with torch.no_grad():
             gen = model.sample_from_x(x, cond_steps=cond, num_steps=horizon - cond, deterministic=True)
             gen = gen.reshape(E, -1, *x.shape[-3:])[:, :horizon].clamp(0, 1).cpu()
-            mo = model(x[:, :T + 1], deterministic=True, with_loss=False)
+            mo = model(x[:, :T + 1].contiguous(), deterministic=True, with_loss=False)   # the model .view()s its input
             Tm = T + 1
             shp = (E, Tm) + tuple(x.shape[-3:])
             dec = {"rec": mo["rec_rgb"].reshape(shp).clamp(0, 1).cpu(),
