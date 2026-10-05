@@ -3,7 +3,10 @@ Single-GPU training of LPWM
 """
 # imports
 import numpy as np
+import hashlib
 import os
+import random
+import time
 from tqdm import tqdm
 import matplotlib
 import argparse
@@ -14,6 +17,7 @@ from torch.utils.data import DataLoader
 import torchvision.utils as vutils
 import torch.optim as optim
 # modules
+import lpwm_stn
 from models import DLP
 # datasets
 from datasets.get_dataset import get_video_dataset
@@ -23,6 +27,7 @@ from utils.util_func import plot_keypoints_on_image_batch, prepare_logdir, save_
     LinearWithWarmupScheduler, format_epoch_summary, plot_training_metrics, save_metrics_data, save_code_backup
 from eval.eval_model import evaluate_validation_elbo_dyn, animate_trajectory_lpwm
 from eval.eval_gen_metrics import eval_lpwm_im_metric
+from utils.compile_utils import compile_for_training, compile_mode_from_config
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
@@ -41,6 +46,25 @@ def train_ddlp(config_path='./configs/balls.json'):
         device = torch.device(f'{device}' if torch.cuda.is_available() else 'cpu')
     else:
         device = torch.device('cpu')
+    # optional keys (same meaning as in train_dlp.py); when absent the behaviour is exactly the previous one
+    seed = config.get('seed')  # fixes initial weights, data order and sampling noise
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    stn_backend = config.get('stn_backend')  # 'reference' (the default) or 'triton'
+    if stn_backend is not None:
+        lpwm_stn.set_backend(stn_backend)
+    fused_composite = bool(config.get('fused_composite', False))  # fused paste + composite in the decoder
+    particle_dec_channels_last = bool(config.get('particle_dec_channels_last', False))  # channels_last particle decoder CNN
+    log_step_timing = bool(config.get('log_step_timing', False)) and device.type == 'cuda'  # per-epoch step time/memory
+    compile_mode = compile_mode_from_config(config)  # torch.compile of the training forward (see utils/compile_utils.py)
+    # TF32 tensor cores for fp32 matmul/linear (a precision change; cuDNN convs already use TF32 by torch default)
+    tf32_matmul = bool(config.get('tf32_matmul', False))
+    if tf32_matmul:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    max_steps_per_epoch = config.get('max_steps_per_epoch')  # cap training steps per epoch (short runs); None = all
 
     # data and general
     ds = config['ds']
@@ -162,8 +186,11 @@ def train_ddlp(config_path='./configs/balls.json'):
 
     # load data
     dataset = get_video_dataset(ds, root, seq_len=timestep_horizon + 1, mode='train', image_size=image_size)
+    loader_kwargs = {}
+    if seed is not None:
+        loader_kwargs['generator'] = torch.Generator().manual_seed(seed)  # same shuffling order in every run
     dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
-                            drop_last=True)
+                            drop_last=True, **loader_kwargs)
     # model
     model = DLP(cdim=ch,  # Number of input image channels
                 image_size=image_size,  # Input image size (assumed square)
@@ -248,6 +275,9 @@ def train_ddlp(config_path='./configs/balls.json'):
                 language_embed_dim=language_embed_dim,  # embedding dimension for each token
                 language_max_len=language_max_len,  # maximum tokens per prompt
                 img_goal_condition=img_goal_condition,  # condition the future on image goal
+                # opt-in optimizations (default off = original path)
+                fused_composite=fused_composite,
+                particle_dec_channels_last=particle_dec_channels_last,
                 ).to(device)
     model_info = model.info()
     print(model.info())
@@ -263,6 +293,19 @@ def train_ddlp(config_path='./configs/balls.json'):
     backup_info = save_code_backup('.', backup_dir=os.path.join(log_dir, 'saves', 'code_backup'))
     log_line(log_dir, backup_info)
     print(backup_info)
+    # which optimized path this run actually uses (checked again after the first step)
+    path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
+                 f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}"
+                 f" | torch_compile: {compile_mode} | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"
+                 f" | seed: {seed} | log_step_timing: {log_step_timing}"
+                 f" | max_steps_per_epoch: {max_steps_per_epoch}")
+    if seed is not None:  # lets separate runs prove they started from identical weights
+        weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
+        path_info += f" | init_weights_sha256: {weights_hash.hexdigest()[:16]}"
+    print(path_info)
+    log_line(log_dir, path_info + '\n')
+    # compiled module for the training forward only; validation/plots/checkpoints keep the uncompiled `model`
+    train_model = model if compile_mode is None else compile_for_training(model, compile_mode)
 
     # get the range of the keypoints, it is [-1, 1] by default
     kp_range = model.kp_range
@@ -321,8 +364,13 @@ def train_ddlp(config_path='./configs/balls.json'):
     warmup_iteration = 0
     max_warmup_iterations = int(0.8 * iter_per_epoch)
 
+    path_checked = False
     for epoch in range(start_epoch, num_epochs):
         model.train()
+        if log_step_timing:
+            torch.cuda.reset_peak_memory_stats(device)
+            step_events = []
+            epoch_t0 = time.perf_counter()
         batch_losses = []
         batch_losses_rec = []
         batch_losses_kl = []
@@ -364,13 +412,48 @@ def train_ddlp(config_path='./configs/balls.json'):
             # reads the last batch's value; every other batch can skip materializing
             # the [bs, n_kp, 1, h, w] stack (see docs/stn_alpha_masks_api_plan.md)
             need_masks = plot_this_epoch and batch_idx == len(dataloader) - 1
-            model_output = model(x, actions=actions, lang_embed=lang_embed, warmup=warmup, with_loss=True,
+            if max_steps_per_epoch is not None:  # the capped epoch's last step is the plotting batch
+                need_masks = plot_this_epoch and batch_idx == min(len(dataloader), max_steps_per_epoch) - 1
+            if log_step_timing:
+                step_start = torch.cuda.Event(enable_timing=True)
+                step_start.record()
+            if compile_mode == 'reduce-overhead':
+                torch.compiler.cudagraph_mark_step_begin()  # CUDA graphs: a new training iteration starts
+            model_output = train_model(x, actions=actions, lang_embed=lang_embed, warmup=warmup, with_loss=True,
                                  return_alpha_masks=need_masks,
                                  beta_kl=beta_kl,
                                  beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
                                  dynamic_discount=discount, recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec, beta_obj=beta_obj,
                                  done_mask=ep_done_mask, x_goal=x_goal)
+            if not path_checked:
+                # a config that asks for an optimized path must actually take it (and only then);
+                # in LPWM the decoder may run more than once per step, so counts are checked as > 0
+                fused_calls = model.decoder_module.fused_composite_calls
+                pd_net = model.decoder_module.particle_dec
+                cl_calls = getattr(pd_net, 'channels_last_calls', 0)
+                cl_weights_ok = all(m.weight.is_contiguous(memory_format=torch.channels_last)
+                                    for m in pd_net.modules() if isinstance(m, torch.nn.Conv2d))
+                problems = []
+                if stn_backend is not None and lpwm_stn.get_backend_name() != stn_backend:
+                    problems.append(f"backend={lpwm_stn.get_backend_name()} (requested {stn_backend})")
+                if (fused_calls > 0) != fused_composite:
+                    problems.append(f"fused_composite_calls={fused_calls} (requested {fused_composite})")
+                if (cl_calls > 0) != particle_dec_channels_last or (particle_dec_channels_last and not cl_weights_ok):
+                    problems.append(f"channels_last_calls={cl_calls}, weights channels_last={cl_weights_ok} "
+                                    f"(requested {particle_dec_channels_last})")
+                if tf32_matmul and not torch.backends.cuda.matmul.allow_tf32:
+                    problems.append("matmul TF32 is off (requested tf32_matmul=True)")
+                if problems:
+                    raise RuntimeError("requested optimization path not in effect: " + "; ".join(problems))
+                check_info = (f"path check (first step) ok: backend={lpwm_stn.get_backend_name()}, "
+                              f"fused_composite_calls={fused_calls}, particle_dec_channels_last_calls={cl_calls}, "
+                              f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}, "
+                              f"first_batch_sha256={hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:16]}, "
+                              f"first_step_loss={model_output['loss_dict']['loss'].item():.9f}")
+                print(check_info)
+                log_line(log_dir, check_info + '\n')
+                path_checked = True
             # calculate loss
             all_losses = model_output['loss_dict']
             iteration += 1
@@ -379,6 +462,10 @@ def train_ddlp(config_path='./configs/balls.json'):
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            if log_step_timing:
+                step_end = torch.cuda.Event(enable_timing=True)
+                step_end.record()
+                step_events.append((step_start, step_end))
 
             # output for logging and plotting
             mu_p = model_output['kp_p']
@@ -445,8 +532,24 @@ def train_ddlp(config_path='./configs/balls.json'):
                 if warmup_iteration > max_warmup_iterations:
                     warmup_iteration = 0
                     break
+            if max_steps_per_epoch is not None and batch_idx + 1 >= max_steps_per_epoch:
+                break
             # break  # for debug
         pbar.close()
+        if log_step_timing and step_events:
+            torch.cuda.synchronize(device)
+            step_ms = sorted(a.elapsed_time(b) for a, b in step_events)
+            timing_info = (f"[step-timing] epoch={epoch} iters={len(step_ms)} median_ms={step_ms[len(step_ms) // 2]:.3f} "
+                           f"mean_ms={sum(step_ms) / len(step_ms):.3f} "
+                           f"peak_alloc_mb={torch.cuda.max_memory_allocated(device) / 1e6:.1f} "
+                           f"train_loss={np.mean(batch_losses):.6f} train_rec={np.mean(batch_losses_rec):.6f} "
+                           f"psnr={np.mean(batch_psnrs):.4f} "
+                           f"epoch_wall_s={time.perf_counter() - epoch_t0:.2f} "
+                           f"peak_reserved_mb={torch.cuda.max_memory_reserved(device) / 1e6:.1f} "
+                           f"reserved_now_mb={torch.cuda.memory_reserved(device) / 1e6:.1f}")
+            print(timing_info)
+            log_line(log_dir, timing_info + '\n')
+            del step_events
         losses.append(np.mean(batch_losses))
         losses_rec.append(np.mean(batch_losses_rec))
         losses_kl.append(np.mean(batch_losses_kl))

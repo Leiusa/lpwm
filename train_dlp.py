@@ -28,6 +28,7 @@ from utils.util_func import (plot_keypoints_on_image_batch, prepare_logdir, save
                              plot_training_metrics, save_metrics_data, save_code_backup)
 from eval.eval_model import evaluate_validation_elbo
 from eval.eval_gen_metrics import eval_dlp_im_metric
+from utils.compile_utils import compile_for_training, compile_mode_from_config
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
@@ -54,6 +55,12 @@ def train_dlp(config_path='./configs/shapes.json'):
     fused_composite = bool(config.get('fused_composite', False))  # fused paste + composite in the decoder
     particle_dec_channels_last = bool(config.get('particle_dec_channels_last', False))  # channels_last particle decoder CNN
     log_step_timing = bool(config.get('log_step_timing', False))  # per-epoch step time and peak memory
+    # torch.compile of the training forward: false/absent = eager (default), true or "default", "reduce-overhead", ...
+    compile_mode = compile_mode_from_config(config)
+    # TF32 tensor cores for fp32 matmul/linear (a precision change; cuDNN convs already use TF32 by torch default)
+    tf32_matmul = bool(config.get('tf32_matmul', False))
+    if tf32_matmul:
+        torch.backends.cuda.matmul.allow_tf32 = True
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
@@ -214,7 +221,10 @@ def train_dlp(config_path='./configs/shapes.json'):
     log_line(log_dir, model_info)
     path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
                  f" | seed: {seed} | log_step_timing: {log_step_timing}"
-                 f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}")
+                 f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}"
+                 f" | torch_compile: {compile_mode}"
+                 f" | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}")
+    train_model = model if compile_mode is None else compile_for_training(model, compile_mode)
     if seed is not None:  # lets separate runs prove they started from identical weights
         weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
         path_info += f" | init_weights_sha256: {weights_hash.hexdigest()[:16]}"
@@ -314,7 +324,9 @@ def train_dlp(config_path='./configs/shapes.json'):
             if log_step_timing:
                 step_start = torch.cuda.Event(enable_timing=True)
                 step_start.record()
-            model_output = model(x, warmup=warmup, with_loss=True, return_alpha_masks=need_masks,
+            if compile_mode == 'reduce-overhead':
+                torch.compiler.cudagraph_mark_step_begin()  # CUDA graphs: a new training iteration starts
+            model_output = train_model(x, warmup=warmup, with_loss=True, return_alpha_masks=need_masks,
                                  beta_kl=beta_kl,
                                  beta_rec=beta_rec, kl_balance=kl_balance,
                                  recon_loss_type=recon_loss_type,
@@ -335,11 +347,14 @@ def train_dlp(config_path='./configs/shapes.json'):
                     raise RuntimeError(f"requested particle_dec_channels_last={particle_dec_channels_last}, but the first step "
                                        f"ran {cl_calls} channels_last particle_dec forward(s), "
                                        f"conv weights channels_last: {cl_weights_ok}")
+                if tf32_matmul and not torch.backends.cuda.matmul.allow_tf32:
+                    raise RuntimeError("requested tf32_matmul=True, but matmul TF32 is off at the first step")
                 check_info = (f"path check (first step) ok: backend={lpwm_stn.get_backend_name()}, "
                               f"fused_composite_calls={fused_calls}, "
                               f"first_batch_sha256={hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:16]}, "
                               f"first_step_loss={model_output['loss_dict']['loss'].item():.9f}, "
-                              f"particle_dec_channels_last_calls={cl_calls}")
+                              f"particle_dec_channels_last_calls={cl_calls}, "
+                              f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}")
                 print(check_info)
                 log_line(log_dir, check_info + '\n')
             # calculate loss
