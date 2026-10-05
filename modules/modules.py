@@ -2744,7 +2744,7 @@ class ParticleAttributeEncoder(nn.Module):
         self.channels = cnn_channels
         self.image_size = image_size
         self.n_particles = n_particles
-        self.patch_size = int(np.round(anchor_size * (image_size - 1)))  # plain int: torch.compile turns NumPy ints into tensors
+        self.patch_size = np.round(anchor_size * (image_size - 1)).astype(int)
         self.margin = margin
         self.crop_size = self.patch_size + 2 * margin
         self.ch = ch
@@ -2925,7 +2925,7 @@ class ParticleFeaturesEncoder(nn.Module):
         super().__init__()
         self.anchor_size = anchor_size
         self.image_size = image_size
-        self.patch_size = int(np.round(anchor_size * (image_size - 1)))  # plain int: torch.compile turns NumPy ints into tensors
+        self.patch_size = np.round(anchor_size * (image_size - 1)).astype(int)
         self.margin = margin
         self.crop_size = self.patch_size + 2 * margin
         self.ch = ch
@@ -4151,7 +4151,7 @@ class ParticleEncoder(nn.Module):
         self.n_fg_classes = n_fg_classes
         assert learned_feature_dim > 0, "learned_feature_dim must be greater than 0"
         self.anchor_s = anchor_s
-        self.obj_patch_size = int(np.round(anchor_s * (image_size - 1)))  # plain int: torch.compile turns NumPy ints into tensors
+        self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
         self.cdim = cdim
         self.use_resblock = use_resblock
         self.embed_init_std = embed_init_std
@@ -4723,7 +4723,7 @@ class DLPEncoder(nn.Module):
         self.context_dim = context_dim
         self.mask_bg_in_enc = mask_bg_in_enc  # before encoding the bg, mask with the particles' obj_on
         self.anchor_s = anchor_s
-        self.obj_patch_size = int(np.round(anchor_s * (image_size - 1)))  # plain int: torch.compile turns NumPy ints into tensors
+        self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
         self.obj_on_min = obj_on_min
         self.obj_on_max = obj_on_max
         self.use_resblock = use_resblock
@@ -5237,7 +5237,7 @@ class DLPDecoder(nn.Module):
         assert learned_feature_dim > 0, "learned_feature_dim must be greater than 0"
         self.anchor_s = anchor_s
         self.context_dim = context_dim
-        self.obj_patch_size = int(np.round(anchor_s * (image_size - 1)))  # plain int: torch.compile turns NumPy ints into tensors
+        self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
         self.cdim = cdim
         self.use_resblock = use_resblock
         self.decode_with_ctx = decode_with_ctx
