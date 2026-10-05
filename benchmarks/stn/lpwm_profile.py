@@ -71,6 +71,11 @@ def main():
     ap.add_argument("--depth", type=int, default=2, help="module name depth to time (1 = encoder_module, 2 = encoder_module.x)")
     ap.add_argument("--override", action="append", default=[], help="config key=value (JSON value), repeatable")
     ap.add_argument("--tf32-matmul", action="store_true", help="allow TF32 for matmul (precision change)")
+    ap.add_argument("--compile", default=None, metavar="MODE",
+                    help="profile the torch.compile'd training step (utils/compile_utils.compile_for_training, MODE = "
+                         "default | reduce-overhead). Per-module timing is skipped (module boundaries are fused); step "
+                         "split and kernel categories are reported. Use 'default' for the kernel breakdown: with "
+                         "reduce-overhead the kernels run inside CUDA graph replays and may not be listed individually.")
     ap.add_argument("--out", default="prof_lpwm")
     args = ap.parse_args()
 
@@ -142,17 +147,25 @@ def main():
                 rec["rf"][name].pop().__exit__(None, None, None)
         return f
 
-    for name, m in timed.items():
-        m.register_forward_pre_hook(pre(name))
-        m.register_forward_hook(post(name))
+    if args.compile:   # hooks inside a compiled graph would break it: no per-module timing in this mode
+        from utils.compile_utils import compile_for_training
+        step_model = compile_for_training(model, args.compile)
+        args.warmup = max(args.warmup, 5)   # first step compiles; give the graph time to settle
+    else:
+        step_model = model
+        for name, m in timed.items():
+            m.register_forward_pre_hook(pre(name))
+            m.register_forward_hook(post(name))
 
     def one_step(record, scope=False):
         x = next(it)[0].to("cuda", non_blocking=True)
         ev = [torch.cuda.Event(enable_timing=True) for _ in range(4)]
         rec["active"] = record
         rec["scope"] = scope
+        if args.compile == "reduce-overhead":
+            torch.compiler.cudagraph_mark_step_begin()
         ev[0].record()
-        out = model(x, **kw)
+        out = step_model(x, **kw)
         loss = out["loss_dict"]["loss"]
         ev[1].record()
         rec["active"] = False
@@ -256,10 +269,19 @@ def main():
 
     s = result["step_split_median_ms"]
     print(f"== {result['gpu']} | backend={result['stn_backend']} fused={result['fused_composite']} cl={result['particle_dec_channels_last']} "
-          f"tf32_matmul={args.tf32_matmul} | batch {cfg['batch_size']} x {T + 1} frames | particles: prior {model.n_kp_prior}, "
-          f"encoder {model.n_kp_enc}, decoder {model.n_kp_dec} | overrides {args.override}")
+          f"tf32_matmul={args.tf32_matmul} compile={args.compile} | batch {cfg['batch_size']} x {T + 1} frames | particles: "
+          f"prior {model.n_kp_prior}, encoder {model.n_kp_enc}, decoder {model.n_kp_dec} | overrides {args.override}")
     print(f"step {s['step_ms']:.1f} ms = forward {s['forward_ms']:.1f} + backward {s['backward_ms']:.1f} + optimizer "
           f"{s['optimizer_ms']:.1f} | peak allocated {peak_alloc / 1e3:.1f} GB")
+    if args.compile:
+        print("(compiled step: per-module timing skipped, module boundaries are fused)")
+    else:
+        print_module_tables(modules, split, s, dlp_cats, module_cats)
+    print_kernel_tables(categories, top_kernels, args.out)
+    return 0
+
+
+def print_module_tables(modules, split, s, dlp_cats, module_cats):
     print("\n-- forward time per module (nested modules are included in their parents)")
     print(f"{'module':52s} {'fwd ms':>8s} {'% fwd':>6s} {'% step':>7s} {'calls':>6s} {'kept MB':>9s}")
     for name, r in sorted(modules.items(), key=lambda kv: -kv[1]["forward_ms_per_step"]):
@@ -283,14 +305,16 @@ def main():
         if sum(cs.values()) < 0.5:
             continue
         print(f"{name[:52]:52s} " + " ".join(f"{cs.get(c, 0.0):8.1f}" for c in order))
+
+
+def print_kernel_tables(categories, top_kernels, out):
     print("\n-- GPU kernel time by category (forward + backward + optimizer)")
     for k, v in categories.items():
         print(f"{k:36s} {v['ms_per_step']:8.1f} ms  {v['pct_of_gpu_time']:5.1f}%")
     print("\n-- top kernels")
     for k in top_kernels[:12]:
         print(f"{k['ms_per_step']:8.2f} ms {k['pct']:5.1f}%  {k['name'][:110]}")
-    print(f"\nwrote {args.out}/lpwm_profile.json and {args.out}/trace.json")
-    return 0
+    print(f"\nwrote {out}/lpwm_profile.json and {out}/trace.json")
 
 
 if __name__ == "__main__":
