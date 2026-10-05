@@ -31,21 +31,27 @@ flags() {
 
 echo "== 1/2 compiled step (reduce-overhead)"
 for V in base bench nondet both base_again; do
-  python $S/lpwm_profile.py --config "$CFG" --tf32-matmul --compile reduce-overhead --steps 30 --profile-steps 1 \
-    $(flags $V) --out "$OUT/compiled_$V" > "$OUT/compiled_$V.log" 2>&1
+  if ! python $S/lpwm_profile.py --config "$CFG" --tf32-matmul --compile reduce-overhead --steps 30 --profile-steps 1 \
+    $(flags $V) --out "$OUT/compiled_$V" > "$OUT/compiled_$V.log" 2>&1; then
+    echo "$V: FAILED, last lines of $OUT/compiled_$V.log:"; tail -n 8 "$OUT/compiled_$V.log"
+  fi
   rm -f "$OUT/compiled_$V/trace.json"
-  echo "$V: $(grep -a '^step ' "$OUT/compiled_$V.log")"
+  echo "$V: $(grep -a '^step ' "$OUT/compiled_$V.log" || true)"
 done
 
 echo "== 2/2 eager forward + backward by module (base vs both)"
 for V in base both; do
-  python $S/lpwm_profile.py --config "$CFG" --tf32-matmul --depth 3 $(flags $V) --out "$OUT/eager_$V" > "$OUT/eager_$V.log" 2>&1
+  if python $S/lpwm_profile.py --config "$CFG" --tf32-matmul --depth 3 $(flags $V) --out "$OUT/eager_$V" > "$OUT/eager_$V.log" 2>&1; then
+    python $S/lpwm_profile_tables.py "$OUT/eager_$V/lpwm_profile.json" --top 20 > "$OUT/eager_$V.txt"
+  else
+    { echo "FAILED, last lines of $OUT/eager_$V.log:"; tail -n 8 "$OUT/eager_$V.log"; } | tee "$OUT/eager_$V.txt"
+  fi
   rm -f "$OUT/eager_$V/trace.json"
-  python $S/lpwm_profile_tables.py "$OUT/eager_$V/lpwm_profile.json" --top 20 > "$OUT/eager_$V.txt"
 done
 
 { echo "== compiled step (reduce-overhead, TF32 matmul), median of 30 steps"
-  for V in base bench nondet both base_again; do echo "$V: $(grep -a '^step ' "$OUT/compiled_$V.log")"; done
+  for V in base bench nondet both base_again; do
+    echo "$V: $(grep -a '^step ' "$OUT/compiled_$V.log" || { echo FAILED; tail -n 3 "$OUT/compiled_$V.log"; })"; done
   for V in base both; do echo; echo "== eager $V"; cat "$OUT/eager_$V.txt"; done
 } > "$OUT/report.txt"
 cat "$OUT/report.txt"
