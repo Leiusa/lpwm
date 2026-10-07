@@ -1,7 +1,7 @@
 # DLP Training Speedup: What Changed and How to Apply It to Your DLP Code
 
 Author: Junhong Lin (rpadcmu@gmail.com), with advisor Tal Daniel. Branch: `release/dlp-speedup` (based on
-`research/stn-composite-fusion`, commit `00accf5`). Last updated 2026-10-07.
+`research/stn-composite-fusion`, commit `00accf5`). Last updated 2026-10-06.
 
 This guide is written so that the optimizations can be ported into **a different version of the DLP code** whose key
 parts (the STN crop in the particle encoders, the STN paste in the decoder, and the depth-weighted alpha compositing)
