@@ -39,6 +39,21 @@ import tempfile
 RULE_FACTOR, RULE_FLOOR = 10.0, 1e-7
 
 
+class default_dtype:
+    """The original code builds some tensors with the default dtype (e.g. reference.spatial_transform's affine matrix
+    via torch.zeros(2, 3)); the float64 ground truth therefore runs with the default dtype set to float64."""
+    def __init__(self, dtype):
+        import torch
+        self.torch, self.dtype = torch, dtype
+
+    def __enter__(self):
+        self.prev = self.torch.get_default_dtype()
+        self.torch.set_default_dtype(self.dtype)
+
+    def __exit__(self, *exc):
+        self.torch.set_default_dtype(self.prev)
+
+
 def rel(a, b):
     import torch
     a, b = a.double(), b.double()
@@ -99,11 +114,13 @@ def part1(args, torch):
 
         def run(fn, inputs, dtype):
             ins = [t.to(dev, dtype).requires_grad_(True) if t is not None else None for t in inputs]
-            outs = fn(*ins)
-            outs = [o for o in (outs if isinstance(outs, (tuple, list)) else (outs,)) if o is not None]
-            gg = torch.Generator(device="cpu").manual_seed(1)
-            loss = sum((o * torch.randn(o.shape, generator=gg).to(dev, o.dtype)).sum() for o in outs)
-            grads = torch.autograd.grad(loss, [t for t in ins if t is not None], allow_unused=True)
+            with default_dtype(dtype if dtype == torch.float64 else torch.get_default_dtype()):
+                outs = fn(*ins)
+                outs = [o for o in (outs if isinstance(outs, (tuple, list)) else (outs,)) if o is not None]
+                gg = torch.Generator(device="cpu").manual_seed(1)
+                loss = sum((o * torch.randn(o.shape, generator=gg, dtype=torch.float32).to(dev, o.dtype)).sum()
+                           for o in outs)
+                grads = torch.autograd.grad(loss, [t for t in ins if t is not None], allow_unused=True)
             return [o.detach() for o in outs], [gr.detach() if gr is not None else torch.zeros_like(t) for gr, t in
                                                 zip(grads, [t for t in ins if t is not None])]
 
@@ -195,7 +212,8 @@ def part2(args, torch):
     on, gn = run(m_new, "triton", x, rf32)
     info["fused_composite_calls"] = m_new.decoder_module.fused_composite_calls
     try:
-        o64, g64 = run(m64, "reference", x.double(), rf64)
+        with default_dtype(torch.float64):
+            o64, g64 = run(m64, "reference", x.double(), rf64)
     except Exception as exc:  # the model may hard-code float32 somewhere: report the fp32 comparison without a verdict
         info["fp64_error"] = f"{type(exc).__name__}: {str(exc)[:300]}"
         info["loss"] = {"original_fp32": o32["loss"].item(), "optimized_fp32": on["loss"].item()}
