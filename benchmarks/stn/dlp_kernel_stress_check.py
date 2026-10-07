@@ -184,7 +184,9 @@ def part2(args, torch):
     info = {"n_kp_prior": m_ref.n_kp_prior, "n_kp_enc": m_ref.n_kp_enc, "n_kp_dec": m_ref.n_kp_dec,
             "batch_size": args.model_batch_size}
     ds = get_image_dataset(cfg["ds"], cfg["root"], mode="train", image_size=cfg["image_size"])
-    x = torch.stack([ds[i][0] for i in range(args.model_batch_size)]).cuda().unsqueeze(1)
+    x = torch.stack([ds[i][0] for i in range(args.model_batch_size)]).cuda()
+    if x.dim() == 4:  # as train_dlp.py: [bs, ch, h, w] -> [bs, 1, ch, h, w]
+        x = x.unsqueeze(1)
     if cfg["recon_loss_type"] == "vgg":
         rf32 = LossLPIPS(normalized_rgb=cfg["normalize_rgb"]).cuda()
         rf64 = LossLPIPS(normalized_rgb=cfg["normalize_rgb"]).cuda().double()
@@ -257,6 +259,7 @@ def main():
     ap.add_argument("--n-kp-enc", default="all", help='part 2: "all" (no filtering), a number, or "" for the config value')
     ap.add_argument("--model-batch-size", type=int, default=4)
     ap.add_argument("--skip-part2", action="store_true")
+    ap.add_argument("--skip-part1", action="store_true", help="only the whole-model check")
     ap.add_argument("--out", default="kernel_stress")
     args = ap.parse_args()
     repo = os.path.abspath(args.repo_root)
@@ -271,7 +274,8 @@ def main():
     print(f"{torch.cuda.get_device_name(0)} | torch {torch.__version__} | part 1: {args.particles} particles, batch "
           f"{args.batch_size}, image {args.img_size}, glimpse {args.patch_size} | rule err_new <= {RULE_FACTOR:g} * "
           f"err_ref32 + {RULE_FLOOR:g}")
-    res = {"rule": f"err_new <= {RULE_FACTOR} * err_ref32 + {RULE_FLOOR}", "part1": part1(args, torch)}
+    res = {"rule": f"err_new <= {RULE_FACTOR} * err_ref32 + {RULE_FLOOR}",
+           "part1": {} if args.skip_part1 else part1(args, torch)}
     ok = True
     for scen, rows in res["part1"].items():
         ok &= report(f"part 1 [{scen}]", rows)
