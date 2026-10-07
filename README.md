@@ -1,3 +1,7 @@
+> **DLP training speedup — start here: [DLP_SPEEDUP_GUIDE.md](DLP_SPEEDUP_GUIDE.md).** What changed, the recommended
+> config (single-image DLP step 102 → 50 ms on GH200, no precision-reducing change), how to port it into another DLP
+> version, and the scripts that verify the port (correctness vs float64, whole-model gradients, speed on your GPU).
+
 # LPWM STN GPU Optimization
 
 This research branch contains my work with Carnegie Mellon University's
