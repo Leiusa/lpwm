@@ -112,13 +112,6 @@ loss. The training script now requests it only for the batch that is plotted. Al
   recommend keeping it `true`.
 - Memory: about +7 GB during the first epoch only (algorithm trials), then identical.
 
-### 2.7 Not recommended (measured)
-| Option | Result | Why not |
-|---|---|---|
-| `tf32_matmul: true` | Single-image DLP: no gain (61.3 → 61.8 ms). LPWM: −36% (transformers) | The only precision-reducing option; useless for DLP |
-| `particle_dec_channels_last: true` | Faster on RTX 3090, **slower** on GH200 (33.5 → 38.5 ms) due to layout copies | GPU-dependent; changes conv algorithms |
-| LPWM: `reduce-overhead` + `cudnn_benchmark` | Out of memory on a 94.5 GB GH200 (cause unknown; not workspace size) | Use `default` + `cudnn_benchmark` for LPWM. Single-image DLP is fine |
-
 ---
 
 ## 3. Requirements and limits
@@ -419,35 +412,3 @@ Check the log for the `path check (first step) ok: ...` line and the `[step-timi
 | Single-image DLP, GH200 | Table in Section 0 | 1 run per config, drift 1% |
 | LPWM (BAIR, 17 frames, batch 5), GH200 | 820 → ~390 ms/step (−52%) with Triton+fused+compile+TF32; 94.4 → ~67 GB; ~347 ms with cuDNN benchmark (`default` compile) | TF32: 3 seeds + visual check, no consistent direction |
 | Correctness at 256 particles | Section 6.1 / 6.2 | GH200 |
-
----
-
-## 8. Caveats and open items
-1. **GPU-specific.** Every number here is from RTX 3090 or GH200. On GH200 the Triton STN alone gives only −6% because
-   the original `grid_sample` is already fast there; compile and cuDNN benchmark give most of the gain. Measure on your
-   GPU (6.3).
-2. **Particle count.** The −51% is with 90 particles. Without filtering (all 256) the balance changes (more
-   paste/composite and decoder conv work, relatively less launch overhead); this configuration is being measured.
-3. **Full-run time.** The speedup is per training step. Validation, image saving and checkpointing are not
-   accelerated, so a whole run saves somewhat less. It does not drift over time: compute per step is fixed.
-4. **Quality.** Correctness is established at the kernel and gradient level (Section 6), and single-image DLP quality
-   was checked with 6 seeds at 90 particles on RTX 3090. A **long paired run at 256 particles on a complex dataset
-   (original vs recommended, plus a second seed of the original as the yardstick) has not been done yet.**
-5. **Reproducibility.** With `cudnn_benchmark: true`, two runs with the same seed are no longer bit-identical. For a
-   bit-exact comparison set it to `false`.
-6. **Precision.** The recommended config contains no precision-reducing change. TF32 matmul is the only such option
-   and is not recommended for DLP.
-
----
-
-## 9. Troubleshooting
-
-| Symptom | Cause / fix |
-|---|---|
-| `requested optimization path not in effect` / path check `RuntimeError` | The requested backend, fused composite or cuDNN flags did not take effect; check `lpwm_stn.set_backend` runs before the first forward and the model was built with `fused_composite=True` |
-| `fused_composite=True but the input is unsupported: ...` | See the reason; typical: non-fp32 input (AMP), non-contiguous tensors in your own call path, `translation` is used, or `z_scale` shape `[B, K, 1]` |
-| Dynamo / `SymInt` / stride assertion inside a Triton launcher under compile | The ops are not wrapped: `compile_for_training` must patch the module attribute your code actually calls (4.6) |
-| Triton compile error mentioning `constexpr` on Triton ≥ 3.3 | Use this branch's `lpwm_stn/composite_backward.py` |
-| Out of memory with `reduce-overhead` + `cudnn_benchmark` | Seen in LPWM only; use `torch_compile: "default"` |
-| No speedup from `stn_backend: "triton"` | Inputs fell back (3.2): not CUDA/fp32, or `padding_mode` not `border` for crop |
-| Slow first epoch | Compilation (1.5–3 min) and cuDNN algorithm trials; reported times use epoch 1+ |
