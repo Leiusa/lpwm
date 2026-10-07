@@ -61,6 +61,14 @@ def train_dlp(config_path='./configs/shapes.json'):
     tf32_matmul = bool(config.get('tf32_matmul', False))
     if tf32_matmul:
         torch.backends.cuda.matmul.allow_tf32 = True
+    # cuDNN conv algorithm selection (module defaults above: benchmark off, deterministic on). benchmark=True times the
+    # candidate algorithms per shape; deterministic=False also allows algorithms that vary run to run at rounding level.
+    # Same TF32 conv precision either way; only bit-exact reproducibility is given up.
+    cudnn_benchmark = bool(config.get('cudnn_benchmark', False))
+    cudnn_deterministic = bool(config.get('cudnn_deterministic', True))
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    torch.backends.cudnn.deterministic = cudnn_deterministic
+    max_steps_per_epoch = config.get('max_steps_per_epoch')  # cap training steps per epoch (short runs); None = all
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
@@ -223,7 +231,10 @@ def train_dlp(config_path='./configs/shapes.json'):
                  f" | seed: {seed} | log_step_timing: {log_step_timing}"
                  f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}"
                  f" | torch_compile: {compile_mode}"
-                 f" | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}")
+                 f" | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"
+                 f" | cudnn_benchmark: {torch.backends.cudnn.benchmark}"
+                 f" | cudnn_deterministic: {torch.backends.cudnn.deterministic}"
+                 f" | max_steps_per_epoch: {max_steps_per_epoch}")
     train_model = model if compile_mode is None else compile_for_training(model, compile_mode)
     if seed is not None:  # lets separate runs prove they started from identical weights
         weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
@@ -321,6 +332,8 @@ def train_dlp(config_path='./configs/shapes.json'):
             # reads the last batch's value; every other batch can skip materializing
             # the [bs, n_kp, 1, h, w] stack (see docs/stn_alpha_masks_api_plan.md)
             need_masks = plot_this_epoch and batch_idx == len(dataloader) - 1
+            if max_steps_per_epoch is not None:  # the capped epoch's last step is the plotting batch
+                need_masks = plot_this_epoch and batch_idx == min(len(dataloader), max_steps_per_epoch) - 1
             if log_step_timing:
                 step_start = torch.cuda.Event(enable_timing=True)
                 step_start.record()
@@ -349,12 +362,18 @@ def train_dlp(config_path='./configs/shapes.json'):
                                        f"conv weights channels_last: {cl_weights_ok}")
                 if tf32_matmul and not torch.backends.cuda.matmul.allow_tf32:
                     raise RuntimeError("requested tf32_matmul=True, but matmul TF32 is off at the first step")
+                if (torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) != (cudnn_benchmark, cudnn_deterministic):
+                    raise RuntimeError(f"requested cudnn benchmark/deterministic={cudnn_benchmark}/{cudnn_deterministic}, "
+                                       f"but the first step ran with {torch.backends.cudnn.benchmark}/"
+                                       f"{torch.backends.cudnn.deterministic}")
                 check_info = (f"path check (first step) ok: backend={lpwm_stn.get_backend_name()}, "
                               f"fused_composite_calls={fused_calls}, "
                               f"first_batch_sha256={hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:16]}, "
                               f"first_step_loss={model_output['loss_dict']['loss'].item():.9f}, "
                               f"particle_dec_channels_last_calls={cl_calls}, "
-                              f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}")
+                              f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}, "
+                              f"cudnn_benchmark={torch.backends.cudnn.benchmark}, "
+                              f"cudnn_deterministic={torch.backends.cudnn.deterministic}")
                 print(check_info)
                 log_line(log_dir, check_info + '\n')
             # calculate loss
@@ -426,6 +445,8 @@ def train_dlp(config_path='./configs/shapes.json'):
                              kl=loss_kl.data.cpu().item(), on_l1=obj_on_l1.cpu().item(),
                              a=a_mean.data.cpu().item(), b=b_mean.data.cpu().item(),
                              smu=mu_scale_mean.data.cpu().item())
+            if max_steps_per_epoch is not None and batch_idx + 1 >= max_steps_per_epoch:
+                break
             # break  # for debug
         pbar.close()
         if log_step_timing:

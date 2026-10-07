@@ -64,6 +64,13 @@ def train_ddlp(config_path='./configs/balls.json'):
     tf32_matmul = bool(config.get('tf32_matmul', False))
     if tf32_matmul:
         torch.backends.cuda.matmul.allow_tf32 = True
+    # cuDNN conv algorithm selection (module defaults above: benchmark off, deterministic on). benchmark=True times the
+    # candidate algorithms per shape; deterministic=False also allows algorithms that vary run to run at rounding level.
+    # Same TF32 conv precision either way; only bit-exact reproducibility is given up.
+    cudnn_benchmark = bool(config.get('cudnn_benchmark', False))
+    cudnn_deterministic = bool(config.get('cudnn_deterministic', True))
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    torch.backends.cudnn.deterministic = cudnn_deterministic
     max_steps_per_epoch = config.get('max_steps_per_epoch')  # cap training steps per epoch (short runs); None = all
 
     # data and general
@@ -297,6 +304,8 @@ def train_ddlp(config_path='./configs/balls.json'):
     path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
                  f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}"
                  f" | torch_compile: {compile_mode} | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"
+                 f" | cudnn_benchmark: {torch.backends.cudnn.benchmark}"
+                 f" | cudnn_deterministic: {torch.backends.cudnn.deterministic}"
                  f" | seed: {seed} | log_step_timing: {log_step_timing}"
                  f" | max_steps_per_epoch: {max_steps_per_epoch}")
     if seed is not None:  # lets separate runs prove they started from identical weights
@@ -444,11 +453,16 @@ def train_ddlp(config_path='./configs/balls.json'):
                                     f"(requested {particle_dec_channels_last})")
                 if tf32_matmul and not torch.backends.cuda.matmul.allow_tf32:
                     problems.append("matmul TF32 is off (requested tf32_matmul=True)")
+                if (torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) != (cudnn_benchmark, cudnn_deterministic):
+                    problems.append(f"cudnn benchmark/deterministic = {torch.backends.cudnn.benchmark}/"
+                                    f"{torch.backends.cudnn.deterministic} (requested {cudnn_benchmark}/{cudnn_deterministic})")
                 if problems:
                     raise RuntimeError("requested optimization path not in effect: " + "; ".join(problems))
                 check_info = (f"path check (first step) ok: backend={lpwm_stn.get_backend_name()}, "
                               f"fused_composite_calls={fused_calls}, particle_dec_channels_last_calls={cl_calls}, "
                               f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}, "
+                              f"cudnn_benchmark={torch.backends.cudnn.benchmark}, "
+                              f"cudnn_deterministic={torch.backends.cudnn.deterministic}, "
                               f"first_batch_sha256={hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:16]}, "
                               f"first_step_loss={model_output['loss_dict']['loss'].item():.9f}")
                 print(check_info)
