@@ -1,7 +1,7 @@
 # DLP Training Speedup: What Changed and How to Apply It to Your DLP Code
 
 Author: Junhong Lin (rpadcmu@gmail.com), with advisor Tal Daniel. Branch: `release/dlp-speedup` (based on
-`research/stn-composite-fusion`, commit `00accf5`). Last updated 2026-10-06.
+`research/stn-composite-fusion`, commit `00accf5`). Last updated 2026-10-19 (Section 4.8: torch.compile warning fix).
 
 This guide is written so that the optimizations can be ported into **a different version of the DLP code** whose key
 parts (the STN crop in the particle encoders, the STN paste in the decoder, and the depth-weighted alpha compositing)
@@ -51,8 +51,8 @@ been done yet.
 |---|---|---|
 | `lpwm_stn/` | Self-contained package: reference STN (the original PyTorch code, unchanged numerics), Triton crop/paste kernels, fused paste+composite kernels, backend registry | **Yes, copy as is** |
 | `utils/compile_utils.py` | `compile_for_training()` (torch.compile with the Triton ops kept out of the graph) and `compile_mode_from_config()` | **Yes, copy** (adjust 1 import, Section 4.6) |
-| `modules/modules.py` | 3 call sites switched to `lpwm_stn` (2× crop, 1× paste), fused-composite branch in `DLPDecoder`, `return_alpha_masks` plumbing, optional channels-last in `ObjectDecoderCNN` | Port the edits (Sections 4.2–4.5) |
-| `models.py` | `DLP.__init__` gets `fused_composite` / `particle_dec_channels_last`; `return_alpha_masks` passed through | Port the edits (Section 4.4–4.5) |
+| `modules/modules.py` | 3 call sites switched to `lpwm_stn` (2× crop, 1× paste), fused-composite branch in `DLPDecoder`, `return_alpha_masks` plumbing, optional channels-last in `ObjectDecoderCNN`, patch sizes as Python ints | Port the edits (Sections 4.2–4.5, 4.8) |
+| `models.py` | `DLP.__init__` gets `fused_composite` / `particle_dec_channels_last`; `return_alpha_masks` passed through; `obj_patch_size` as Python int | Port the edits (Sections 4.4–4.5, 4.8) |
 | `utils/util_func.py` | `spatial_transform`, `affine_grid_sample`, `create_masks_*` now re-exported from `lpwm_stn` | Optional (Section 4.7) |
 | `train_dlp.py`, `train_lpwm.py` | Opt-in config keys, compile wrapper, cuDNN switches, first-step path check, step timing | Port the edits (Section 4.6) |
 | `benchmarks/stn/dlp_kernel_stress_check.py` | Kernel correctness vs float64 ground truth (+ whole model) | Run after porting (6.1) |
@@ -100,6 +100,9 @@ loss. The training script now requests it only for the batch that is plotted. Al
 - Cost: each compilation takes 1.5–3 minutes, and a recompilation happens once when the `warmup` flag flips. Negligible
   for long runs, noticeable in short tests.
 - Precision: fp32; fusion changes rounding order only (max |diff| ≈ 5e-4 on [0, 1] pixel outputs).
+- If the log shows `Backend compiler exception ... aten._local_scalar_dense.default` pointing at
+  `.view(-1, self.num_chans, *self.patch_size)`, apply Section 4.8 (patch sizes as Python ints). Training still runs
+  without it; the warning means one piece of the particle decoder falls back to eager.
 
 ### 2.6 cuDNN algorithm selection — `cudnn_benchmark: true` (keep `cudnn_deterministic: true`)
 - The original scripts set `torch.backends.cudnn.benchmark = False` and `deterministic = True` at import time, so cuDNN
@@ -328,6 +331,67 @@ from the requested backend, or if the cuDNN flags differ from the config. The sc
 This branch re-exports `affine_grid_sample`, `spatial_transform`, `create_masks_fast`, `create_masks_with_scale` from
 `lpwm_stn` so that every STN op goes through one backend registry. This is not needed for the speedup. If you skip it,
 make sure the names used in 4.3/4.4 come from `lpwm_stn`.
+
+### 4.8 Patch sizes as plain Python ints (fixes a torch.compile warning)
+**Symptom.** With `torch_compile` on, the log shows (several times, once per compilation) something like:
+```
+torch/_dynamo/exc.py: Backend compiler exception
+  Explanation: Backend compiler `inductor` failed with aten._local_scalar_dense.default
+  While executing %out : call_method[target=view](args = (%h_25, -1, 4, %l_self_modules_particle_dec_patch_size_0_, ...
+  File ".../modules/modules.py", line ..., in forward
+    out = self.cnn(conv_in).view(-1, self.num_chans, *self.patch_size)
+  ... Adding a graph break.
+```
+Training continues normally afterwards.
+
+**Cause.** `np.round(...).astype(int)` returns a NumPy integer (`numpy.int64`), not a Python `int`. torch.compile
+treats NumPy scalars as tensors, so the `.view(...)` with the patch size needs to read a tensor value back
+(`aten._local_scalar_dense`), which inductor cannot compile. Dynamo then splits the graph there and runs that piece
+eagerly. With Python ints the size is a compile-time constant and the warning disappears.
+
+**Fix: a type conversion only, the values are unchanged.** Commit `ac93ec4` on `lambda-sync`, cherry-picked here.
+Find the sites in your code with:
+```bash
+grep -n "astype(int)" models.py modules/modules.py
+grep -n "isinstance(patch_size, int)" modules/modules.py
+```
+1. **Every place that computes a patch size** (in this repository: `DLP.__init__` in `models.py`; `ParticleAttributeEncoder`,
+   `ParticleFeaturesEncoder`, `ParticleEncoder`, `DLPEncoder`, `DLPDecoder` in `modules/modules.py`, 6 sites in total):
+   ```python
+   # BEFORE
+   self.obj_patch_size = np.round(anchor_s * (image_size - 1)).astype(int)
+   self.patch_size = np.round(anchor_size * (image_size - 1)).astype(int)
+   # AFTER
+   self.obj_patch_size = int(np.round(anchor_s * (image_size - 1)))
+   self.patch_size = int(np.round(anchor_size * (image_size - 1)))
+   ```
+   (Keep your own variable names, e.g. `self.anchor_s` in `models.py`; only wrap the expression in `int(...)` and drop
+   `.astype(int)`.)
+2. **The constructors of the particle decoders** (`ObjectDecoderCNN`, `ObjectDecoderCNNFILM`, `ObjectDecoderCNNConcat`;
+   each does `.view(-1, self.num_chans, *self.patch_size)`, 3 sites). This also catches a NumPy int passed from anywhere
+   else; note that `isinstance(np.int64(3), int)` is `False`, so the original check did not recognize it:
+   ```python
+   # BEFORE
+   if isinstance(patch_size, int):
+       patch_size = (patch_size, patch_size)
+   self.patch_size = patch_size
+   # AFTER
+   if isinstance(patch_size, (int, np.integer)):
+       patch_size = (patch_size, patch_size)
+   self.patch_size = tuple(int(p) for p in patch_size)  # plain ints: torch.compile turns NumPy ints into tensors
+   ```
+   (`modules/modules.py` already has `import numpy as np`.)
+
+**Check.** Run with compile on and confirm the warning is gone, e.g.
+`grep -c "Backend compiler exception" <your log>` → `0`. Remaining graph breaks should all read
+`Skip calling torch.compiler.disable()d function` (`stn_crop`, `composite_fused`); those are the intended boundaries
+from 2.5.
+
+**Measured effect** (GH200, single-image DLP, BAIR 128×128, batch 16, 256 particles, `benchmarks/stn/dlp_profile.py`,
+one run each): warnings 4 → 0 in each compiled run; step time with the recommended config 86.7 → 86.4 ms (no change;
+the particle decoder is dominated by cuDNN convolutions, which run the same either way); 19 graph breaks, all from the
+intended boundaries. Numerically, the piece that used to run eagerly is now compiled, so rounding can differ at the
+level of 2.5's fusion note; no separate quality run was made for this change.
 
 ---
 
