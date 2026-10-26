@@ -82,6 +82,7 @@ def train_dlp(config_path='./configs/shapes.json'):
     torch.backends.cudnn.benchmark = cudnn_benchmark
     torch.backends.cudnn.deterministic = cudnn_deterministic
     max_steps_per_epoch = config.get('max_steps_per_epoch')  # cap training steps per epoch (short runs); None = all
+    num_workers = int(config.get('num_workers', 4))  # DataLoader workers per process
     # data and general
     ds = config['ds']
     ch = config['ch']  # image channels
@@ -165,7 +166,7 @@ def train_dlp(config_path='./configs/shapes.json'):
     if seed is not None:
         loader_kwargs['generator'] = torch.Generator().manual_seed(seed)  # same shuffling order in every run
     # batch_size is per process: the global batch is batch_size * accelerator.num_processes
-    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
+    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
                             drop_last=True, **loader_kwargs)
     # model
     model = DLP(
@@ -653,6 +654,13 @@ def train_dlp(config_path='./configs/shapes.json'):
             plot_training_metrics(metrics_data, run_name, fig_dir, max_plots_per_figure=4)
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
+    if log_step_timing:
+        # DDP keeps the replicas identical only if gradients were all-reduced every step: equal hashes on all
+        # processes after training = synchronized
+        final_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes()
+                                             for p in unwrapped_model.parameters())).hexdigest()[:16]
+        print(f"[final-weights] process {accelerator.process_index}/{accelerator.num_processes} "
+              f"sha256={final_hash}", flush=True)
     return unwrapped_model
 
 
