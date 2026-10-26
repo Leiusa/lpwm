@@ -287,12 +287,15 @@ class CausalParticleSelfAttention(nn.Module):
         else:
             self.rel_pos_bias = nn.Identity()
 
-    def forward(self, x):
+    def forward(self, x, kv=None):
         B, N, T, C = x.size()  # batch size, n_particles, sequence length, embedding dimensionality (n_embd)
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         k = self.key(x).view(B, N * T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, N * T, hs)
         q = self.query(x).view(B, N * T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, N * T, hs)
         v = self.value(x).view(B, N * T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, N * T, hs)
+
+        if kv is not None:
+            return self._forward_cached(q, k, v, kv)
 
         if self.torch_attn:
             y = F.scaled_dot_product_attention(query=q, key=k, value=v, is_causal=True,
@@ -324,6 +327,34 @@ class CausalParticleSelfAttention(nn.Module):
         y = self.resid_drop(self.proj(y))
         y = y.view(B, N, T, -1)
         return y
+
+    def _forward_cached(self, q, k, v, kv):
+        # inference with a key/value cache (DLPDynamics.sample(kv_cache=True)): q, k, v hold only the new
+        # timesteps, kv['k'], kv['v'] the earlier ones of the same sequence; the new keys/values are appended.
+        # Same arithmetic as the manual path above, restricted to the query rows of the new timesteps.
+        # Temporal attention only (one particle per sequence, as SpatioTemporalBlock calls it).
+        B, nh, T, hs = q.shape
+        assert not self.torch_attn and not self.training, "kv cache: inference with the manual attention path only"
+        if kv.get('k') is not None:
+            k = torch.cat([kv['k'], k], dim=2)
+            v = torch.cat([kv['v'], v], dim=2)
+        kv['k'], kv['v'] = k, v
+        T_all = k.shape[2]
+        T_past = T_all - T
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))  # (B, nh, T, T_all)
+        if self.positional_bias:
+            if self.max_particles is not None:
+                bias_t, bias_p = self.rel_pos_bias(T_all, num_particles=1)
+                att = att + bias_p.reshape(1, bias_p.shape[1], 1, 1)
+            else:
+                bias_t, _ = self.rel_pos_bias(T_all)
+            att = att + bias_t.reshape(1, bias_t.shape[1], T_all, T_all)[:, :, T_past:]
+        att = att.masked_fill(self.mask[0, 0, 0, T_past:T_all, 0, :T_all] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        y = att @ v  # (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, nh * hs)
+        y = self.proj(y)
+        return y.view(B, 1, T, -1)
 
 
 class ParticleSelfAttention(nn.Module):
@@ -559,7 +590,7 @@ class CausalBlock(nn.Module):
         else:
             self.c_proj = None
 
-    def forward(self, x, c=None):
+    def forward(self, x, c=None, kv=None):
         if self.context_cond and c is not None:
             c_proj = self.c_proj(c).chunk(self.c_multiplier, dim=-1)
             scale_a, scale_b, shift_a, shift_b = c_proj[0], c_proj[1], c_proj[2], c_proj[3]
@@ -568,10 +599,10 @@ class CausalBlock(nn.Module):
             else:
                 gate_a = gate_b = 1.0
             x = x + self.attn_scale * gate_a * self.attn(
-                modulate(self.ln1(x), scale_a, shift_a, self.residual_modulation))
+                modulate(self.ln1(x), scale_a, shift_a, self.residual_modulation), kv=kv)
             x = x + gate_b * self.mlp(modulate(self.ln2(x), scale_b, shift_b, self.residual_modulation))
         else:
-            x = x + self.attn_scale * self.attn(self.ln1(x))
+            x = x + self.attn_scale * self.attn(self.ln1(x), kv=kv)
             x = x + self.mlp(self.ln2(x))
         return x
 
@@ -617,7 +648,8 @@ class SpatioTemporalBlock(nn.Module):
         else:
             self.cross_block = nn.Identity()
 
-    def forward(self, x, c=None, l=None):
+    def forward(self, x, c=None, l=None, kv=None):
+        # kv: this block's key/value cache for the temporal attention (inference only), x the new timesteps
         # x: [b, n + 1, t, f]
         # c: context conditioning via AdaLN: [b, n+1, t, f] or None
         # l: language conditioning via cross-attention: [b, t, h, f] or None, h=N_l is the number of lang tokens
@@ -642,7 +674,11 @@ class SpatioTemporalBlock(nn.Module):
                     c_t = c.reshape(-1, 1, T, F)  # [b * (n + 1), 1, t, f]
                 else:
                     c_t = None
-                x = self.temp_block(x, c_t)
+                if kv is None:
+                    x = self.temp_block(x, c_t)
+                else:
+                    assert self.causal, "kv cache needs causal temporal attention"
+                    x = self.temp_block(x, c_t, kv=kv)
                 x = x.view(B, N, T, F)  # [b, n + 1, t, f]
             elif attn_type == 'cross' and self.cross_attn_cond and l is not None:
                 x = x.permute(0, 2, 1, 3)  # [b, t, n + 1, f]
@@ -845,6 +881,10 @@ class ParticleSpatioTemporalTransformer(nn.Module):
     def get_block_size(self):
         return self.block_size
 
+    def new_kv_cache(self):
+        # per-layer key/value cache of the temporal attention, filled by forward(..., kv_cache=)
+        return {'t': 0, 'layers': [{} for _ in self.blocks]}
+
     def init_weights(self):
         # initialize layers
         pass
@@ -873,7 +913,9 @@ class ParticleSpatioTemporalTransformer(nn.Module):
             torch.nn.init.zeros_(module.bias)
             torch.nn.init.ones_(module.weight)
 
-    def forward(self, x, c=None, l=None):
+    def forward(self, x, c=None, l=None, kv_cache=None):
+        # kv_cache (inference only): None, or a dict from new_kv_cache() that holds the earlier timesteps of the
+        # sequence; x (and c, l) then hold only the new timesteps, which are appended to the cache
         if self.particles_first:
             b, n, t, f = x.size()
             if c is not None:
@@ -893,7 +935,8 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                     c = c.permute(0, 2, 1, 3)  # [bs, n_c, t, d]
                     n_c = c.shape[1]
         # n is the number of particles
-        assert t <= self.block_size, "Cannot forward, model block size is exhausted."
+        t0 = 0 if kv_cache is None else kv_cache['t']  # absolute timestep of the first row of x
+        assert t0 + t <= self.block_size, "Cannot forward, model block size is exhausted."
         assert f == self.n_embed, "invalid particle feature dim"
 
         # add register tokens
@@ -902,12 +945,12 @@ class ParticleSpatioTemporalTransformer(nn.Module):
             # [bs, n + n_mem_particles, t, f]
 
         if not self.positional_bias and not self.pos_embed_t_adaln:
-            position_embeddings = self.pos_emb[:, None, :t, :]
+            position_embeddings = self.pos_emb[:, None, t0:t0 + t, :]
             x = x + position_embeddings
 
         # prepare condition
         if self.pos_embed_t_adaln:
-            c_t = self.pos_embed_t_embedding[:, :, :t].repeat(x.shape[0], x.shape[1], 1, 1)
+            c_t = self.pos_embed_t_embedding[:, :, t0:t0 + t].repeat(x.shape[0], x.shape[1], 1, 1)
             if c is None:
                 c = c_t
             else:
@@ -922,8 +965,13 @@ class ParticleSpatioTemporalTransformer(nn.Module):
         else:
             c_in = c
 
-        for block in self.blocks:
-            x = block(x, c_in, l)
+        if kv_cache is None:
+            for block in self.blocks:
+                x = block(x, c_in, l)
+        else:
+            for block, kv in zip(self.blocks, kv_cache['layers']):
+                x = block(x, c_in, l, kv=kv)
+            kv_cache['t'] = t0 + t
 
         if self.n_registers > 0:
             x = x[:, :-self.n_registers]
@@ -5796,8 +5844,9 @@ class DLPContext(nn.Module):
     def encode_all(self, z, z_scale, z_obj_on, z_depth, z_features, z_bg_features=None, z_base_var=None,
                    z_score=None, patch_id_embed=None, deterministic=False, warmup=False,
                    detach_before_proj=False, encode_posterior=True, encode_prior=True, actions=None, actions_mask=None,
-                   lang_embed=None, z_goal=None, detach_z_goal=False):
+                   lang_embed=None, z_goal=None, detach_z_goal=False, kv_cache=None):
         """
+        kv_cache: see ParticleSpatioTemporalTransformer.forward (inference only; inputs = the new timesteps)
         output order:
         if with_bg and ctx_pool_mode='token': [n_particles, bg, ctx, ctx_token*]
         else: [n_particles, ctx, ctx_token*]
@@ -6007,7 +6056,7 @@ class DLPContext(nn.Module):
                 c = c_objon
 
 
-        particles_out = self.pte(particle_projection, c=c, l=l)
+        particles_out = self.pte(particle_projection, c=c, l=l, kv_cache=kv_cache)
         # [bs, ts, n, f]
         if self.language_condition and self.language_condition_type == 'self':
             particles_out = particles_out[:, :, :-self.language_max_len].contiguous()
@@ -6146,11 +6195,12 @@ class DLPContext(nn.Module):
     def forward(self, z, z_scale, z_obj_on, z_depth, z_features, z_bg_features=None, z_base_var=None,
                 z_score=None, patch_id_embed=None, deterministic=False, warmup=False,
                 encode_posterior=True, encode_prior=True, actions=None, actions_mask=None, lang_embed=None,
-                z_goal=None):
+                z_goal=None, kv_cache=None):
         output_dict = self.encode_all(z, z_scale, z_obj_on, z_depth, z_features, z_bg_features, z_base_var, z_score,
                                       patch_id_embed, deterministic=deterministic, warmup=warmup,
                                       encode_posterior=encode_posterior, encode_prior=encode_prior, actions=actions,
-                                      actions_mask=actions_mask, lang_embed=lang_embed, z_goal=z_goal)
+                                      actions_mask=actions_mask, lang_embed=lang_embed, z_goal=z_goal,
+                                      kv_cache=kv_cache)
         return output_dict
 
 
@@ -6396,7 +6446,7 @@ class DLPDynamics(nn.Module):
 
     def sample(self, z, z_scale, z_obj_on, z_depth, z_features, z_bg_features, z_context=None,
                z_score=None, steps=10, deterministic=False, deterministic_particles=True, actions=None,
-               actions_mask=None, lang_embed=None, z_goal=None, return_context_posterior=False):
+               actions_mask=None, lang_embed=None, z_goal=None, return_context_posterior=False, kv_cache=False):
         """
         Samples a sequence of particle states based on the given conditioning inputs and internal model dynamics.
 
@@ -6413,6 +6463,10 @@ class DLPDynamics(nn.Module):
             steps (int): Number of forward sampling steps. Defaults to 10.
             deterministic (bool): If True, the sampling is deterministic. Defaults to False.
             deterministic_particles (bool): If True, uses deterministic particles during sampling. Defaults to True.
+            kv_cache (bool): If True, the context and dynamics transformers keep the keys/values of the earlier
+                timesteps and run only on the new ones. Exact while the sequence fits in the block size; once it
+                is longer, each step recomputes the last block_size timesteps as without the cache (the window
+                slides, so cached keys/values no longer hold). Defaults to False.
 
         Returns:
             dict: A dictionary containing sampled outputs:
@@ -6441,36 +6495,53 @@ class DLPDynamics(nn.Module):
 
         mu_context_posterior = z_context_posterior = z_context  # initialize in case they are needed
         bs, timestep_horizon, n_particles, _ = z.shape
+        ctx_cache = dyn_cache = None
+        if kv_cache:
+            assert not self.training, "kv_cache is for inference"
+            assert not return_context_posterior, "kv_cache: return_context_posterior is not supported"
+            assert not self.random_action_condition, "kv_cache: random actions are redrawn for every timestep"
+            if self.context_dim > 0:
+                ctx = self.context_decoder
+                assert not ctx.random_action_condition, "kv_cache: random actions are redrawn for every timestep"
+                assert not (ctx.img_goal_condition and z_goal is None), "kv_cache: pass z_goal"
+                ctx_cache = ctx.pte.new_kv_cache()
+            dyn_cache = self.particle_transformer.new_kv_cache()
         for k in range(steps):
+            start_step = max(z.shape[1] - block_size, 0)
+            end_step = min(start_step + block_size, z.shape[1])
+            if start_step > 0:
+                ctx_cache = dyn_cache = None  # the window slides: recompute it, as without the cache
+            # first timestep each module runs on: start_step, or the first one not yet in its cache
+            ctx_lo = start_step if ctx_cache is None else ctx_cache['t']
+            dyn_lo = start_step if dyn_cache is None else dyn_cache['t']
             # first generate context, then use the context with the current particles
             if self.context_dim > 0:
-                start_step = max(z.shape[1] - block_size, 0)
-                end_step = min(start_step + block_size, z.shape[1])
                 # check if context was provided
                 if z_context is None or z_context.shape[1] < z.shape[1]:
                     # generate context
                     if actions is not None:
-                        actions_in = actions[:, start_step:end_step]
+                        actions_in = actions[:, ctx_lo:end_step]
                     else:
                         actions_in = None
                     if actions_mask is not None:
-                        actions_mask_in = actions_mask[:, start_step:end_step]
+                        actions_mask_in = actions_mask[:, ctx_lo:end_step]
                     else:
                         actions_mask_in = None
-                    ctx_dec_out = self.context_decoder(z=z[:, -block_size:],
-                                                       z_scale=z_scale[:, -block_size:],
-                                                       z_obj_on=z_obj_on[:, -block_size:],
-                                                       z_depth=z_depth[:, -block_size:],
-                                                       z_features=z_features[:, -block_size:],
-                                                       z_bg_features=z_bg_features[:, -block_size:],
-                                                       z_score=z_score[:, -block_size:],
+                    ctx_dec_out = self.context_decoder(z=z[:, ctx_lo:],
+                                                       z_scale=z_scale[:, ctx_lo:],
+                                                       z_obj_on=z_obj_on[:, ctx_lo:],
+                                                       z_depth=z_depth[:, ctx_lo:],
+                                                       z_features=z_features[:, ctx_lo:],
+                                                       z_bg_features=z_bg_features[:, ctx_lo:],
+                                                       z_score=z_score[:, ctx_lo:],
                                                        deterministic=deterministic,
                                                        encode_posterior=return_context_posterior,
                                                        encode_prior=True,
                                                        actions=actions_in,
                                                        actions_mask=actions_mask_in,
                                                        lang_embed=lang_embed,
-                                                       z_goal=z_goal)
+                                                       z_goal=z_goal,
+                                                       kv_cache=ctx_cache)
                     z_context_last = ctx_dec_out['z_context_dyn'][:, -1:]
 
                     new_z_context = z_context_last
@@ -6497,18 +6568,18 @@ class DLPDynamics(nn.Module):
                 # prepare input to dyn module
                 # start_step = max(z.shape[1] - block_size, 0)
                 # end_step = min(start_step + block_size, z.shape[1])
-                z_context_v = z_context[:, start_step:end_step].reshape(-1, *z_context.shape[2:])
+                z_context_v = z_context[:, dyn_lo:end_step].reshape(-1, *z_context.shape[2:])
             else:
                 z_context_v = None
 
             # project particles
-            z_v = z[:, -block_size:].reshape(-1, *z.shape[2:])
-            z_scale_v = z_scale[:, -block_size:].reshape(-1, *z_scale.shape[2:])
-            z_obj_on_v = z_obj_on[:, -block_size:].reshape(-1, *z_obj_on.shape[2:])
-            z_depth_v = z_depth[:, -block_size:].reshape(-1, *z_depth.shape[2:])
-            z_features_v = z_features[:, -block_size:].reshape(-1, *z_features.shape[2:])
-            z_bg_features_v = z_bg_features[:, -block_size:].reshape(-1, *z_bg_features.shape[2:])
-            z_score_v = z_score[:, -block_size:].reshape(-1, *z_score.shape[2:])
+            z_v = z[:, dyn_lo:].reshape(-1, *z.shape[2:])
+            z_scale_v = z_scale[:, dyn_lo:].reshape(-1, *z_scale.shape[2:])
+            z_obj_on_v = z_obj_on[:, dyn_lo:].reshape(-1, *z_obj_on.shape[2:])
+            z_depth_v = z_depth[:, dyn_lo:].reshape(-1, *z_depth.shape[2:])
+            z_features_v = z_features[:, dyn_lo:].reshape(-1, *z_features.shape[2:])
+            z_bg_features_v = z_bg_features[:, dyn_lo:].reshape(-1, *z_bg_features.shape[2:])
+            z_score_v = z_score[:, dyn_lo:].reshape(-1, *z_score.shape[2:])
             if self.use_z_orig:
                 z_orig_v = self.particles_anchor.repeat(z_v.shape[0], 1, 1)
             else:
@@ -6535,14 +6606,12 @@ class DLPDynamics(nn.Module):
                     c_random_action = 0
 
                 if self.action_condition and actions is not None:
-                    start_step = max(z.shape[1] - block_size, 0)
-                    end_step = min(start_step + block_size, z.shape[1])
-                    actions_v = actions[:, start_step:end_step]
+                    actions_v = actions[:, dyn_lo:end_step]
                     if self.learn_null_action_embed and actions_mask is not None:
                         # action_mask: [batch_size, T] or [batch_size, T, 1], 1 where use action, 0 replace action
                         # Expand mask
                         if len(actions_mask.shape) == 2:
-                            actions_mask_v = actions_mask[:, start_step:end_step].bool().unsqueeze(
+                            actions_mask_v = actions_mask[:, dyn_lo:end_step].bool().unsqueeze(
                                 -1)  # (batch_size, seq_len, 1)
                         # Expand null embedding to match
                         null_action_embeds = self.null_action_embeddings.expand(actions_v.size(0), actions_v.size(1),
@@ -6585,7 +6654,7 @@ class DLPDynamics(nn.Module):
                 c = c + c_pe
 
             if c is not None and self.pos_embed_objon_adaln:
-                c_objon = self.objon_embeddings(z_obj_on[:, -block_size:])  # [bs, t, n, dim]
+                c_objon = self.objon_embeddings(z_obj_on[:, dyn_lo:])  # [bs, t, n, dim]
                 c_objon_bg = torch.zeros(c_objon.shape[0], c_objon.shape[1], 1, c_objon.shape[-1],
                                          device=c_objon.device)
                 c_objon = torch.cat([c_objon, c_objon_bg], dim=2)  # [bs, t, n + 1, dim]
@@ -6595,7 +6664,7 @@ class DLPDynamics(nn.Module):
                     # [bs, n_views * (n + 1), t, dim]
                 c = c + c_objon
 
-            particles_trans = self.particle_transformer(particle_proj_int, c)
+            particles_trans = self.particle_transformer(particle_proj_int, c, kv_cache=dyn_cache)
             if self.n_views > 1:
                 # [bs, n_views * n, T, d] -> [bs * n_views, n, T, d]
                 particles_trans = particles_trans.reshape(bs, -1, *particles_trans.shape[2:])

@@ -872,7 +872,7 @@ class DLP(nn.Module):
 
     def sample_from_x(self, x, num_steps=10, deterministic=True, cond_steps=None, return_z=False, use_all_ctx=False,
                       actions=None, actions_mask=None, lang_embed=None, x_goal=None, decode=True, n_pred_eq_gt=True,
-                      return_context_posterior=False):
+                      return_context_posterior=False, kv_cache=False):
         """
         (Conditional) Sampling from LPWM: x is the conditional frames, encoded to latent particles
          which are unrolled to the future with PINT, and the predicted particles are then decoded to a sequence
@@ -881,6 +881,7 @@ class DLP(nn.Module):
         # use_all_ctx: if True, will encode context from the entire trajectory to condition the prediction
         # this is meant to see if the model is able to follow conditions and reconstruct stochastic trajectories
         # that involve latent stochastic actions
+        # kv_cache: inference speed-up of the dynamics unroll, see DLPDynamics.sample
         # x: [bs, T, ...]
         assert self.is_dynamics_model, f"model timesteps: {self.timestep_horizon} -> non-dynamics model"
         # encode-decode
@@ -974,7 +975,7 @@ class DLP(nn.Module):
         dyn_out = self.dyn_module.sample(z, z_scale, z_obj_on, z_depth, z_features, z_bg_features, z_context,
                                          z_score, steps=num_steps, deterministic=deterministic, actions=actions_dyn,
                                          actions_mask=actions_mask_dyn, lang_embed=lang_embed, z_goal=z_goal_proj,
-                                         return_context_posterior=return_context_posterior)
+                                         return_context_posterior=return_context_posterior, kv_cache=kv_cache)
         z_dyn = dyn_out['z']
         z_scale_dyn = dyn_out['z_scale']
         z_obj_on_dyn = dyn_out['z_obj_on']
@@ -1031,13 +1032,14 @@ class DLP(nn.Module):
 
     def sample_from_z(self, z, z_scale, z_obj_on, z_depth, z_features, z_bg_features, z_context,
                       z_score=None, num_steps=10, deterministic=True, decode=False, actions=None, actions_mask=None,
-                      lang_embed=None, z_goal=None):
+                      lang_embed=None, z_goal=None, kv_cache=False):
         assert self.is_dynamics_model, f"model timesteps: {self.timestep_horizon} -> non-dynamics model"
         batch_size = z.shape[0]
         # dynamics
         dyn_out = self.dyn_module.sample(z, z_scale, z_obj_on, z_depth, z_features, z_bg_features, z_context,
                                          z_score, steps=num_steps, deterministic=deterministic, actions=actions,
-                                         actions_mask=actions_mask, lang_embed=lang_embed, z_goal=z_goal)
+                                         actions_mask=actions_mask, lang_embed=lang_embed, z_goal=z_goal,
+                                         kv_cache=kv_cache)
         z_dyn = dyn_out['z']
         z_scale_dyn = dyn_out['z_scale']
         z_obj_on_dyn = dyn_out['z_obj_on']
