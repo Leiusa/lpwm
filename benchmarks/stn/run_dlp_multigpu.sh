@@ -13,7 +13,10 @@
 # eval_im_metrics off, tf32_matmul off, cudnn deterministic on; OVERRIDE_JSON is applied to every row
 # (e.g. '{"n_kp_enc": "all"}' = no particle filtering).
 # Report: last-epoch [step-timing] of the main process (epoch 0 pays compilation and cuDNN trials), images/s over
-# all GPUs, scaling efficiency = images/s(N) / (N x images/s(1)) per row, peak memory per GPU.
+# all GPUs, scaling efficiency = images/s(N) / (N x images/s(1)) per row, peak memory per GPU. Two clocks: "step"
+# = GPU step after the batch is on the device (excludes data loading), "wall" = epoch wall time / steps (includes
+# data loading, logging); a large gap = the input pipeline (CPU) limits. DDP sync check: [final-weights] hashes
+# of all processes must be equal.
 set -uo pipefail
 CFG=${1:?usage: run_dlp_multigpu.sh CONFIG.json [GPU_COUNTS] [EPOCHS] [STEPS] [OVERRIDE_JSON]}
 COUNTS=${2:-"1 2"}
@@ -61,6 +64,13 @@ EOF
     mv -n ./*_mg_"$tag" "$OUT/" 2>/dev/null   # the run directory the training script created
     grep -a "path check" "$OUT/train_$tag.log" | head -"$N"
     grep -a "\[step-timing\]" "$OUT/train_$tag.log" | tail -1
+    hashes=$(grep -a "\[final-weights\]" "$OUT/train_$tag.log" | grep -o 'sha256=[0-9a-f]*' | sort -u)
+    nh=$(grep -a -c "\[final-weights\]" "$OUT/train_$tag.log")
+    if [ "$nh" = "$N" ] && [ "$(echo "$hashes" | wc -l | tr -d " ")" = 1 ]; then
+      echo "$tag: final weights identical on all $N processes ($hashes)" | tee -a "$OUT/sync_check.txt"
+    else
+      echo "$tag: SYNC CHECK FAILED: $nh hash lines, distinct: $(echo $hashes)" | tee -a "$OUT/sync_check.txt"
+    fi
   done
 done
 
@@ -76,7 +86,9 @@ def last_timing(tag):
         return None
     return {k: float(v) for k, v in re.findall(r"(\w+)=([-\d.]+)", lines[-1])}
 print("last epoch, main process (images/s over all GPUs; efficiency = images/s(N) / (N x images/s(1)))")
-print(f"{'row':8s} {'GPUs':>4s} {'step ms':>9s} {'images/s':>9s} {'efficiency':>10s} {'peak GB/GPU':>11s} {'train loss':>10s}")
+print("step = GPU step without data loading; wall = epoch wall time / steps, with data loading")
+print(f"{'row':8s} {'GPUs':>4s} {'step ms':>9s} {'images/s':>9s} {'efficiency':>10s} {'wall ms':>9s} "
+      f"{'wall img/s':>10s} {'wall eff':>8s} {'peak GB/GPU':>11s} {'train loss':>10s}")
 for row in ("A", "C", "C_ro"):
     base = last_timing(f"{row}_1gpu")
     for n in counts:
@@ -84,7 +96,12 @@ for row in ("A", "C", "C_ro"):
         if t is None:
             print(f"{row:8s} {n:>4s} {'FAILED / missing':>30s}"); continue
         eff = t["images_per_s"] / (int(n) * base["images_per_s"]) if base else float("nan")
-        print(f"{row:8s} {n:>4s} {t['median_ms']:9.1f} {t['images_per_s']:9.1f} {eff:10.2f} "
-              f"{t['peak_alloc_mb'] / 1e3:11.2f} {t['train_loss']:10.4f}")
+        wall_ms = 1000 * t["epoch_wall_s"] / t["iters"]
+        wall_ips = t["images_per_s"] * t["median_ms"] / wall_ms
+        base_wall_ips = base["images_per_s"] * base["median_ms"] / (1000 * base["epoch_wall_s"] / base["iters"]) \
+            if base else float("nan")
+        wall_eff = wall_ips / (int(n) * base_wall_ips)
+        print(f"{row:8s} {n:>4s} {t['median_ms']:9.1f} {t['images_per_s']:9.1f} {eff:10.2f} {wall_ms:9.1f} "
+              f"{wall_ips:10.1f} {wall_eff:8.2f} {t['peak_alloc_mb'] / 1e3:11.2f} {t['train_loss']:10.4f}")
 EOF
 echo "report: $OUT/summary.txt (logs: $OUT/train_*.log)"
