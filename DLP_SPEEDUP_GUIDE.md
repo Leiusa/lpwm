@@ -59,6 +59,7 @@ been done yet.
 | `benchmarks/stn/dlp_model_grad_diag.py` | Whole-model gradient consistency vs rounding-level yardsticks | Run after porting (6.2) |
 | `benchmarks/stn/run_dlp_speed_matrix.sh` | Speed of each configuration through the real training script | Run after porting (6.3) |
 | `benchmarks/stn/build_model.py` | Builds `DLP(...)` from a config by matching constructor argument names (used by the two Python checks) | Copy with the checks |
+| `train_dlp_accelerate.py`, `benchmarks/stn/run_dlp_multigpu.sh` | Multi-GPU training (Accelerate DDP) with the same opt-in keys, and its scaling / sync check | See `DLP_MULTIGPU_GUIDE.md` |
 
 ---
 
