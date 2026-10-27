@@ -704,7 +704,8 @@ def train_ddlp(config_path='./configs/balls.json'):
                                   nrow=8, pad_value=1)
 
                 accelerator.save(unwrapped_model.state_dict(), os.path.join(save_dir, f'{ds}_gddlp{run_prefix}.pth'))
-            animate_trajectory_lpwm(model.module, config, epoch, device=accelerator.device, fig_dir=fig_dir,
+            # unwrapped_model (= model.module under DDP): also works with one process, where Accelerate does not wrap
+            animate_trajectory_lpwm(unwrapped_model, config, epoch, device=accelerator.device, fig_dir=fig_dir,
                                     timestep_horizon=animation_horizon, num_trajetories=1,
                                     accelerator=accelerator, train=True, cond_steps=cond_steps)
             eval_model = unwrapped_model
