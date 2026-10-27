@@ -11,9 +11,13 @@ GPUS = ["0", "1", "2", "3"]
 import os
 
 # os.environ["NCCL_P2P_LEVEL"] = "NVL"  # uncomment if torch-distributed/accelerate hangs because old linux kernel
-os.environ["CUDA_VISIBLE_DEVICES"] = ", ".join(GPUS)  # "0, 1, 2, 3"
+if "CUDA_VISIBLE_DEVICES" not in os.environ:  # a scheduler (e.g. Slurm) that already set it decides the GPUs
+    os.environ["CUDA_VISIBLE_DEVICES"] = ", ".join(GPUS)  # "0, 1, 2, 3"
 import numpy as np
 import os
+import hashlib
+import random
+import time
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 import matplotlib
@@ -25,6 +29,7 @@ from torch.utils.data import DataLoader
 import torchvision.utils as vutils
 import torch.optim as optim
 # modules
+import lpwm_stn
 from models import DLP
 # datasets
 from datasets.get_dataset import get_video_dataset
@@ -35,6 +40,7 @@ from utils.util_func import plot_keypoints_on_image_batch, prepare_logdir, save_
 from eval.eval_model import evaluate_validation_elbo_dyn, animate_trajectory_lpwm
 from eval.eval_gen_metrics import eval_lpwm_im_metric
 from accelerate import Accelerator, DistributedDataParallelKwargs
+from utils.compile_utils import compile_for_training, compile_mode_from_config
 
 matplotlib.use("Agg")
 torch.backends.cudnn.benchmark = False
@@ -52,6 +58,31 @@ def train_ddlp(config_path='./configs/balls.json'):
     accelerator = Accelerator(kwargs_handlers=[ddp_kwargs])
     # in conf: "num_processes": num_visible_gpus
     hparams = config  # to save a copy of the hyper-parameters
+    # optional keys (same as train_lpwm.py); when absent the behaviour is exactly the previous one
+    seed = config.get('seed')  # fixes initial weights, data order and sampling noise (same seed on every process)
+    if seed is not None:
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    stn_backend = config.get('stn_backend')  # 'reference' (the default) or 'triton'
+    if stn_backend is not None:
+        lpwm_stn.set_backend(stn_backend)
+    fused_composite = bool(config.get('fused_composite', False))  # fused paste + composite in the decoder
+    log_step_timing = bool(config.get('log_step_timing', False))  # per-epoch step time and peak memory
+    # torch.compile of the training forward: false/absent = eager (default), true or "default", "reduce-overhead", ...
+    compile_mode = compile_mode_from_config(config)
+    # TF32 tensor cores for fp32 matmul/linear (a precision change; cuDNN convs already use TF32 by torch default)
+    tf32_matmul = bool(config.get('tf32_matmul', False))
+    if tf32_matmul:
+        torch.backends.cuda.matmul.allow_tf32 = True
+    # cuDNN conv algorithm selection (module defaults above: benchmark off, deterministic on)
+    cudnn_benchmark = bool(config.get('cudnn_benchmark', False))
+    cudnn_deterministic = bool(config.get('cudnn_deterministic', True))
+    torch.backends.cudnn.benchmark = cudnn_benchmark
+    torch.backends.cudnn.deterministic = cudnn_deterministic
+    max_steps_per_epoch = config.get('max_steps_per_epoch')  # cap training steps per epoch (short runs); None = all
+    num_workers = int(config.get('num_workers', 4))  # DataLoader workers per process
 
     # data and general
     ds = config['ds']
@@ -173,8 +204,12 @@ def train_ddlp(config_path='./configs/balls.json'):
 
     # load data
     dataset = get_video_dataset(ds, root, seq_len=timestep_horizon + 1, mode='train', image_size=image_size)
-    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=4, pin_memory=True,
-                            drop_last=True)
+    loader_kwargs = {}
+    if seed is not None:
+        loader_kwargs['generator'] = torch.Generator().manual_seed(seed)  # same shuffling order in every run
+    # batch_size is per process: the global batch is batch_size * accelerator.num_processes
+    dataloader = DataLoader(dataset, shuffle=True, batch_size=batch_size, num_workers=num_workers, pin_memory=True,
+                            drop_last=True, **loader_kwargs)
     # model
     model = DLP(cdim=ch,  # Number of input image channels
                 image_size=image_size,  # Input image size (assumed square)
@@ -259,6 +294,8 @@ def train_ddlp(config_path='./configs/balls.json'):
                 language_embed_dim=language_embed_dim,  # embedding dimension for each token
                 language_max_len=language_max_len,  # maximum tokens per prompt
                 img_goal_condition=img_goal_condition,  # condition the future on image goal
+                # opt-in optimization (default off = original path)
+                fused_composite=fused_composite,
                 )
     model_info = model.info()
     if accelerator.is_main_process:
@@ -288,7 +325,26 @@ def train_ddlp(config_path='./configs/balls.json'):
     optimizer = optim.Adam(model.parameters(), lr=lr, betas=adam_betas, eps=adam_eps, weight_decay=weight_decay)
     # accelerate baking
     # verbose = accelerator.is_local_main_process
+    if seed is not None:  # before prepare(): lets separate runs prove they started from identical weights
+        weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    # compile the DDP-wrapped model (Dynamo splits the graph at DDP's gradient buckets); `model` stays uncompiled
+    # for validation, plotting and checkpoints, as in train_lpwm.py
+    train_model = model if compile_mode is None else compile_for_training(model, compile_mode)
+    path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {fused_composite}"
+                 f" | seed: {seed} | log_step_timing: {log_step_timing}"
+                 f" | torch_compile: {compile_mode}"
+                 f" | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"
+                 f" | cudnn_benchmark: {torch.backends.cudnn.benchmark}"
+                 f" | cudnn_deterministic: {torch.backends.cudnn.deterministic}"
+                 f" | max_steps_per_epoch: {max_steps_per_epoch}"
+                 f" | num_processes: {accelerator.num_processes} | batch_size per process: {batch_size}"
+                 f" (global {batch_size * accelerator.num_processes})")
+    if seed is not None:
+        path_info += f" | init_weights_sha256: {weights_hash.hexdigest()[:16]}"
+    if accelerator.is_main_process:
+        print(path_info)
+        log_line(log_dir, path_info + '\n')
     if use_scheduler:
         scheduler = LinearWithWarmupScheduler(optimizer, gamma=scheduler_gamma, verbose=False,
                                               steps=(max(warmup_epoch, 1), max(warmup_epoch, 1) + 1),
@@ -336,8 +392,14 @@ def train_ddlp(config_path='./configs/balls.json'):
     warmup_iteration = 0
     max_warmup_iterations = int(0.8 * iter_per_epoch)
 
+    log_step_timing = log_step_timing and accelerator.device.type == 'cuda'
+    path_checked = False
     for epoch in range(start_epoch, num_epochs):
         model.train()
+        if log_step_timing:
+            torch.cuda.reset_peak_memory_stats(accelerator.device)
+            step_events = []
+            epoch_t0 = time.perf_counter()
         batch_losses = []
         batch_losses_rec = []
         batch_losses_kl = []
@@ -379,13 +441,48 @@ def train_ddlp(config_path='./configs/balls.json'):
             # reads the last batch's value; every other batch can skip materializing
             # the [bs, n_kp, 1, h, w] stack (see docs/stn_alpha_masks_api_plan.md)
             need_masks = plot_this_epoch and batch_idx == len(dataloader) - 1
-            model_output = model(x, actions=actions, lang_embed=lang_embed, warmup=warmup, with_loss=True,
+            if max_steps_per_epoch is not None:  # the capped epoch's last step is the plotting batch
+                need_masks = plot_this_epoch and batch_idx == min(len(dataloader), max_steps_per_epoch) - 1
+            if log_step_timing:
+                step_start = torch.cuda.Event(enable_timing=True)
+                step_start.record()
+            if compile_mode == 'reduce-overhead':
+                torch.compiler.cudagraph_mark_step_begin()  # CUDA graphs: a new training iteration starts
+            model_output = train_model(x, actions=actions, lang_embed=lang_embed, warmup=warmup, with_loss=True,
                                  return_alpha_masks=need_masks,
                                  beta_kl=beta_kl,
                                  beta_dyn=beta_dyn, beta_rec=beta_rec, kl_balance=kl_balance,
                                  dynamic_discount=discount, recon_loss_type=recon_loss_type,
                                  recon_loss_func=recon_loss_func, beta_dyn_rec=beta_dyn_rec, beta_obj=beta_obj,
                                  done_mask=ep_done_mask, x_goal=x_goal)
+            if not path_checked:
+                # a config that asks for an optimized path must actually take it (and only then), on every process;
+                # in LPWM the decoder may run more than once per step, so the count is checked as > 0
+                fused_calls = accelerator.unwrap_model(model).decoder_module.fused_composite_calls
+                problems = []
+                if stn_backend is not None and lpwm_stn.get_backend_name() != stn_backend:
+                    problems.append(f"backend={lpwm_stn.get_backend_name()} (requested {stn_backend})")
+                if (fused_calls > 0) != fused_composite:
+                    problems.append(f"fused_composite_calls={fused_calls} (requested {fused_composite})")
+                if tf32_matmul and not torch.backends.cuda.matmul.allow_tf32:
+                    problems.append("matmul TF32 is off (requested tf32_matmul=True)")
+                if (torch.backends.cudnn.benchmark, torch.backends.cudnn.deterministic) != (cudnn_benchmark, cudnn_deterministic):
+                    problems.append(f"cudnn benchmark/deterministic = {torch.backends.cudnn.benchmark}/"
+                                    f"{torch.backends.cudnn.deterministic} (requested {cudnn_benchmark}/{cudnn_deterministic})")
+                if problems:
+                    raise RuntimeError(f"process {accelerator.process_index}: requested optimization path not in "
+                                       f"effect: " + "; ".join(problems))
+                check_info = (f"path check (first step) ok on process {accelerator.process_index}: "
+                              f"backend={lpwm_stn.get_backend_name()}, fused_composite_calls={fused_calls}, "
+                              f"first_batch_sha256={hashlib.sha256(x.detach().cpu().numpy().tobytes()).hexdigest()[:16]}, "
+                              f"first_step_loss={model_output['loss_dict']['loss'].item():.9f}, "
+                              f"matmul_tf32={torch.backends.cuda.matmul.allow_tf32}, "
+                              f"cudnn_benchmark={torch.backends.cudnn.benchmark}, "
+                              f"cudnn_deterministic={torch.backends.cudnn.deterministic}")
+                print(check_info)
+                if accelerator.is_main_process:
+                    log_line(log_dir, check_info + '\n')
+                path_checked = True
             # calculate loss
             all_losses = model_output['loss_dict']
             iteration += 1
@@ -394,6 +491,10 @@ def train_ddlp(config_path='./configs/balls.json'):
             optimizer.zero_grad()
             accelerator.backward(loss)
             optimizer.step()
+            if log_step_timing:
+                step_end = torch.cuda.Event(enable_timing=True)
+                step_end.record()
+                step_events.append((step_start, step_end))
 
             # output for logging and plotting
             mu_p = model_output['kp_p']
@@ -462,9 +563,28 @@ def train_ddlp(config_path='./configs/balls.json'):
                 if warmup_iteration > max_warmup_iterations:
                     warmup_iteration = 0
                     break
+            if max_steps_per_epoch is not None and batch_idx + 1 >= max_steps_per_epoch:
+                break
 
             # break  # for debug
         pbar.close()
+        if log_step_timing and step_events:  # main process's GPU; every process runs the same synchronized steps
+            torch.cuda.synchronize(accelerator.device)
+            step_ms = sorted(a.elapsed_time(b) for a, b in step_events)
+            median_ms = step_ms[len(step_ms) // 2]
+            timing_info = (f"[step-timing] epoch={epoch} iters={len(step_ms)} median_ms={median_ms:.3f} "
+                           f"mean_ms={sum(step_ms) / len(step_ms):.3f} "
+                           f"num_processes={accelerator.num_processes} "
+                           f"sequences_per_s={batch_size * accelerator.num_processes * 1000 / median_ms:.2f} "
+                           f"peak_alloc_mb={torch.cuda.max_memory_allocated(accelerator.device) / 1e6:.1f} "
+                           f"train_loss={np.mean(batch_losses):.6f} train_rec={np.mean(batch_losses_rec):.6f} "
+                           f"psnr={np.mean(batch_psnrs):.4f} "
+                           f"epoch_wall_s={time.perf_counter() - epoch_t0:.2f} "
+                           f"peak_reserved_mb={torch.cuda.max_memory_reserved(accelerator.device) / 1e6:.1f}")
+            if accelerator.is_main_process:
+                print(timing_info)
+                log_line(log_dir, timing_info + '\n')
+            del step_events
         losses.append(np.mean(batch_losses))
         losses_rec.append(np.mean(batch_losses_rec))
         losses_kl.append(np.mean(batch_losses_kl))
@@ -651,6 +771,13 @@ def train_ddlp(config_path='./configs/balls.json'):
 
     accelerator.wait_for_everyone()
     unwrapped_model = accelerator.unwrap_model(model)
+    if log_step_timing:
+        # DDP keeps the replicas identical only if gradients were all-reduced every step: equal hashes on all
+        # processes after training = synchronized
+        final_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes()
+                                             for p in unwrapped_model.parameters())).hexdigest()[:16]
+        print(f"[final-weights] process {accelerator.process_index}/{accelerator.num_processes} "
+              f"sha256={final_hash}", flush=True)
     return unwrapped_model
 
 
