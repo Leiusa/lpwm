@@ -72,6 +72,9 @@ def train_ddlp(config_path='./configs/balls.json'):
     torch.backends.cudnn.benchmark = cudnn_benchmark
     torch.backends.cudnn.deterministic = cudnn_deterministic
     max_steps_per_epoch = config.get('max_steps_per_epoch')  # cap training steps per epoch (short runs); None = all
+    # resume_dir: fixed run directory (instead of a new timestamped one); the full training state is saved to
+    # <resume_dir>/saves/resume.pth after every epoch and loaded at start if present (preemption / requeue)
+    resume_dir = config.get('resume_dir')
 
     # data and general
     ds = config['ds']
@@ -291,9 +294,23 @@ def train_ddlp(config_path='./configs/balls.json'):
 
     # prepare saving location
     run_name = f'{ds}_gddlp' + run_prefix
-    log_dir = prepare_logdir(runname=run_name, src_dir='./')
+    if resume_dir is None:
+        log_dir = prepare_logdir(runname=run_name, src_dir='./')
+    else:
+        log_dir = resume_dir
+        for d in ('figures', 'saves'):
+            os.makedirs(os.path.join(log_dir, d), exist_ok=True)
     fig_dir = os.path.join(log_dir, 'figures')
     save_dir = os.path.join(log_dir, 'saves')
+    resume_path = os.path.join(save_dir, 'resume.pth') if resume_dir is not None else None
+    resume_state = None
+    if resume_path is not None and os.path.exists(resume_path):
+        resume_state = torch.load(resume_path, map_location=device, weights_only=False)
+        model.load_state_dict(resume_state['model'])
+        resume_info = f"resuming from {resume_path}: epoch {resume_state['epoch']} done, " \
+                      f"iteration {resume_state['iteration']}"
+        print(resume_info)
+        log_line(log_dir, resume_info + '\n')
     save_config(log_dir, hparams)
     log_line(log_dir, model_info)
     # save a backup of the code for this run
@@ -310,7 +327,8 @@ def train_ddlp(config_path='./configs/balls.json'):
                  f" | max_steps_per_epoch: {max_steps_per_epoch}")
     if seed is not None:  # lets separate runs prove they started from identical weights
         weights_hash = hashlib.sha256(b"".join(p.detach().cpu().numpy().tobytes() for p in model.parameters()))
-        path_info += f" | init_weights_sha256: {weights_hash.hexdigest()[:16]}"
+        weights_label = "init_weights_sha256" if resume_state is None else "resumed_weights_sha256"
+        path_info += f" | {weights_label}: {weights_hash.hexdigest()[:16]}"
     print(path_info)
     log_line(log_dir, path_info + '\n')
     # compiled module for the training forward only; validation/plots/checkpoints keep the uncompiled `model`
@@ -373,8 +391,34 @@ def train_ddlp(config_path='./configs/balls.json'):
     warmup_iteration = 0
     max_warmup_iterations = int(0.8 * iter_per_epoch)
 
+    first_epoch = start_epoch
+    if resume_state is not None:
+        optimizer.load_state_dict(resume_state['optimizer'])
+        if scheduler is not None:
+            scheduler.load_state_dict(resume_state['scheduler'])
+        h = resume_state['history']
+        (losses, losses_rec, losses_kl, losses_kl_kp, losses_kl_feat, losses_kl_dyn, losses_kl_scale,
+         losses_kl_depth, losses_kl_obj_on, losses_kl_context, valid_losses, psnrs) = (
+            h['losses'], h['losses_rec'], h['losses_kl'], h['losses_kl_kp'], h['losses_kl_feat'],
+            h['losses_kl_dyn'], h['losses_kl_scale'], h['losses_kl_depth'], h['losses_kl_obj_on'],
+            h['losses_kl_context'], h['valid_losses'], h['psnrs'])
+        valid_loss, best_valid_loss, best_valid_epoch = h['valid_loss'], h['best_valid_loss'], h['best_valid_epoch']
+        if eval_im_metrics:
+            val_lpipss, val_lpips = h['val_lpipss'], h['val_lpips']
+            best_val_lpips, best_val_lpips_epoch = h['best_val_lpips'], h['best_val_lpips_epoch']
+        iteration, warmup_iteration = resume_state['iteration'], resume_state['warmup_iteration']
+        rng = resume_state['rng']
+        random.setstate(rng['python'])
+        np.random.set_state(rng['numpy'])
+        torch.set_rng_state(rng['torch'])
+        if rng['cuda'] is not None and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(rng['cuda'])
+        if rng['loader'] is not None and 'generator' in loader_kwargs:
+            loader_kwargs['generator'].set_state(rng['loader'])
+        first_epoch = resume_state['epoch'] + 1
+
     path_checked = False
-    for epoch in range(start_epoch, num_epochs):
+    for epoch in range(first_epoch, num_epochs):
         model.train()
         if log_step_timing:
             torch.cuda.reset_peak_memory_stats(device)
@@ -731,6 +775,28 @@ def train_ddlp(config_path='./configs/balls.json'):
             ]
             save_metrics_data(metrics_data, run_name, save_dir=os.path.join(save_dir, 'metrics'))
             plot_training_metrics(metrics_data, run_name, fig_dir, max_plots_per_figure=4)
+        if resume_path is not None:
+            history = dict(losses=losses, losses_rec=losses_rec, losses_kl=losses_kl, losses_kl_kp=losses_kl_kp,
+                           losses_kl_feat=losses_kl_feat, losses_kl_dyn=losses_kl_dyn,
+                           losses_kl_scale=losses_kl_scale, losses_kl_depth=losses_kl_depth,
+                           losses_kl_obj_on=losses_kl_obj_on, losses_kl_context=losses_kl_context,
+                           valid_losses=valid_losses, psnrs=psnrs, valid_loss=valid_loss,
+                           best_valid_loss=best_valid_loss, best_valid_epoch=best_valid_epoch)
+            if eval_im_metrics:
+                history.update(val_lpipss=val_lpipss, val_lpips=val_lpips, best_val_lpips=best_val_lpips,
+                               best_val_lpips_epoch=best_val_lpips_epoch)
+            state = {'epoch': epoch, 'iteration': iteration, 'warmup_iteration': warmup_iteration,
+                     'model': model.state_dict(), 'optimizer': optimizer.state_dict(),
+                     'scheduler': scheduler.state_dict() if scheduler is not None else None,
+                     'history': history,
+                     'rng': {'python': random.getstate(), 'numpy': np.random.get_state(),
+                             'torch': torch.get_rng_state(),
+                             'cuda': torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None,
+                             'loader': loader_kwargs['generator'].get_state() if 'generator' in loader_kwargs
+                             else None}}
+            torch.save(state, resume_path + '.tmp')
+            os.replace(resume_path + '.tmp', resume_path)  # atomic: a kill during the save keeps the old state
+            log_line(log_dir, f'resume state saved: epoch {epoch}, iteration {iteration}\n')
     return model
 
 
