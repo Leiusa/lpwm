@@ -410,11 +410,12 @@ def train_ddlp(config_path='./configs/balls.json'):
         rng = resume_state['rng']
         random.setstate(rng['python'])
         np.random.set_state(rng['numpy'])
-        torch.set_rng_state(rng['torch'])
+        # RNG states must be CPU ByteTensors; torch.load(map_location=device) moved them to the GPU
+        torch.set_rng_state(rng['torch'].cpu())
         if rng['cuda'] is not None and torch.cuda.is_available():
-            torch.cuda.set_rng_state_all(rng['cuda'])
+            torch.cuda.set_rng_state_all([r.cpu() for r in rng['cuda']])
         if rng['loader'] is not None and 'generator' in loader_kwargs:
-            loader_kwargs['generator'].set_state(rng['loader'])
+            loader_kwargs['generator'].set_state(rng['loader'].cpu())
         first_epoch = resume_state['epoch'] + 1
 
     path_checked = False
