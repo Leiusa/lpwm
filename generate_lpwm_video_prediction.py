@@ -181,6 +181,7 @@ def load_dlp_from_config(conf_path, ckpt_path=None):
                 language_embed_dim=language_embed_dim,  # embedding dimension for each token
                 language_max_len=language_max_len,  # maximum tokens per prompt
                 img_goal_condition=img_goal_condition,  # condition the future on image goal
+                temporal_pos=config.get('temporal_pos', 'abs_adaln'),  # time position (opt-in, see models.py)
                 )
     if ckpt_path is not None:
         try:

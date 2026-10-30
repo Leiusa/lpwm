@@ -285,6 +285,7 @@ def train_ddlp(config_path='./configs/balls.json'):
                 language_embed_dim=language_embed_dim,  # embedding dimension for each token
                 language_max_len=language_max_len,  # maximum tokens per prompt
                 img_goal_condition=img_goal_condition,  # condition the future on image goal
+                temporal_pos=config.get('temporal_pos', 'abs_adaln'),  # time position (opt-in, see models.py)
                 # opt-in optimizations (default off = original path)
                 fused_composite=fused_composite,
                 particle_dec_channels_last=particle_dec_channels_last,
@@ -318,7 +319,7 @@ def train_ddlp(config_path='./configs/balls.json'):
     log_line(log_dir, backup_info)
     print(backup_info)
     # which optimized path this run actually uses (checked again after the first step)
-    path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
+    path_info = (f"temporal_pos: {config.get('temporal_pos', 'abs_adaln')} | STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {model.decoder_module.fused_composite}"
                  f" | particle_dec_channels_last: {model.decoder_module.particle_dec_channels_last}"
                  f" | torch_compile: {compile_mode} | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"
                  f" | cudnn_benchmark: {torch.backends.cudnn.benchmark}"

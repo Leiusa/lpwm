@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 from modules.modules import DLPEncoder, DLPDecoder, DLPContext
-from modules.modules import DLPDynamics
+from modules.modules import DLPDynamics, TEMPORAL_POS_MODES
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \
@@ -136,6 +136,9 @@ class DLP(nn.Module):
                  fused_composite=False,
                  # opt-in: channels_last execution of the particle decoder CNN only; False keeps the original layout
                  particle_dec_channels_last=False,
+                 # time position of the context/dynamics transformers: 'abs_adaln' (original, per-timestep AdaLN
+                 # embedding), 'rel_bias' (relative time bias in the temporal attention) or 'none'
+                 temporal_pos='abs_adaln',
                  ):
         super(DLP, self).__init__()
         """
@@ -346,6 +349,11 @@ class DLP(nn.Module):
         else:
             self.context_dim = 0
         self.causal_ctx = causal_ctx
+        if temporal_pos not in TEMPORAL_POS_MODES:
+            raise ValueError(f"temporal_pos must be one of {TEMPORAL_POS_MODES}, got {temporal_pos!r}")
+        if temporal_pos != 'abs_adaln' and not self.is_dynamics_model:
+            raise ValueError("temporal_pos only applies to dynamics models (timestep_horizon > 1)")
+        self.temporal_pos = temporal_pos
         # global latent context: EXPERIMENTAL, NOT USED IN THE PAPER
         self.global_ctx_pool = global_ctx_pool
         self.pool_ctx_dim = pool_ctx_dim
@@ -510,7 +518,8 @@ class DLP(nn.Module):
                                          language_embed_dim=self.language_embed_dim,
                                          # embedding dimension for each token
                                          language_max_len=self.language_max_len,  # maximum tokens per prompt
-                                         img_goal_condition=self.img_goal_condition
+                                         img_goal_condition=self.img_goal_condition,
+                                         temporal_pos=temporal_pos,
                                          )
             self.encoder_module.ctx_enc = self.ctx_module
         else:
@@ -574,6 +583,7 @@ class DLP(nn.Module):
                                           null_action_embed=(
                                                   self.learn_null_action_embed and not self.action_in_ctx_module),
                                           # learn a "no-input-action" embedding, to learn on action-free videos as well
+                                          temporal_pos=temporal_pos,
                                           )
         else:
             self.dyn_module = nn.Identity()

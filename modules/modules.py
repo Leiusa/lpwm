@@ -613,8 +613,12 @@ class SpatioTemporalBlock(nn.Module):
     def __init__(self, n_embed, n_head, block_size, attn_pdrop=0.1, resid_pdrop=0.1, hidden_dim_multiplier=4,
                  positional_bias=False, activation='gelu', max_particles=None, norm_type='rms', causal=True,
                  context_cond=False, residual_modulation=True, context_gate=False, attn_scale=1.0,
-                 cross_attn_cond=False, attention_order=('spatial', 'temporal')):
+                 cross_attn_cond=False, attention_order=('spatial', 'temporal'), temporal_bias=False):
+        # temporal_bias (opt-in, default off): learned relative time bias in the temporal attention only (one scalar
+        # per head per frame offset); the spatial block is left as it is. Exclusive with positional_bias.
         super().__init__()
+        if temporal_bias and positional_bias:
+            raise ValueError("temporal_bias and positional_bias are exclusive")
         self.context_cond = context_cond
         self.residual_modulation = residual_modulation
         self.context_gate = context_gate
@@ -632,9 +636,11 @@ class SpatioTemporalBlock(nn.Module):
                                       residual_modulation=residual_modulation, context_gate=context_gate,
                                       attn_scale=attn_scale)
         temp_block_type = CausalBlock if self.causal else SelfBlock
+        # temporal_bias: time offsets only (max_particles=None), each temporal sequence holds one particle
         self.temp_block = temp_block_type(n_embed, n_head, block_size, attn_pdrop,
                                           resid_pdrop, hidden_dim_multiplier,
-                                          positional_bias, activation=activation, max_particles=max_particles,
+                                          positional_bias or temporal_bias, activation=activation,
+                                          max_particles=None if temporal_bias else max_particles,
                                           norm_type=norm_type, context_cond=context_cond,
                                           residual_modulation=residual_modulation, context_gate=context_gate,
                                           attn_scale=attn_scale)
@@ -813,9 +819,19 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                  causal=True, context_cond=False, residual_modulation=True, context_gate=True,
                  attention_order=('spatial', 'temporal'), cond_cross_attn=False,
                  token_pool_adaln=False,
-                 pos_embed_t_adaln=False
+                 pos_embed_t_adaln=False,
+                 temporal_pos=None
                  ):
+        # temporal_pos (opt-in): None keeps the original behaviour, set by positional_bias / pos_embed_t_adaln.
+        #   'rel_bias': no per-timestep embedding; a learned relative time bias in the temporal attention logits,
+        #               so keys/values carry no timestep index (sliding kv cache stays position-consistent).
+        #   'none':     no explicit time position at all (only the causal mask orders the frames).
         super().__init__()
+        if temporal_pos not in (None, 'rel_bias', 'none'):
+            raise ValueError(f"temporal_pos must be None, 'rel_bias' or 'none', got {temporal_pos!r}")
+        if temporal_pos is not None and (positional_bias or pos_embed_t_adaln):
+            raise ValueError("temporal_pos replaces positional_bias / pos_embed_t_adaln; set those to False")
+        self.temporal_pos = temporal_pos
         self.positional_bias = positional_bias
         self.max_particles = max_particles  # for positional bias
         self.particles_first = particles_first  # expect [bs, n, t, f], else [bs, t, n, f]
@@ -847,7 +863,7 @@ class ParticleSpatioTemporalTransformer(nn.Module):
         if self.pos_embed_t_adaln:
             self.pos_embed_t_embedding = nn.Parameter(self.init_std * torch.randn(1, 1, block_size, n_embed))
 
-        if self.positional_bias:
+        if self.positional_bias or self.temporal_pos is not None:
             self.pos_emb = nn.Identity()
         else:
             if self.pos_embed_t_adaln:
@@ -867,7 +883,8 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                                                           residual_modulation=residual_modulation,
                                                           context_gate=context_gate, attn_scale=self.attn_scale,
                                                           attention_order=self.attention_order,
-                                                          cross_attn_cond=self.cond_cross_attn)
+                                                          cross_attn_cond=self.cond_cross_attn,
+                                                          temporal_bias=(temporal_pos == 'rel_bias'))
                                       for _ in range(n_layer)])
 
         # decoder head
@@ -944,7 +961,7 @@ class ParticleSpatioTemporalTransformer(nn.Module):
             x = torch.cat([x, self.registers.repeat(b, 1, t, 1)], dim=1)
             # [bs, n + n_mem_particles, t, f]
 
-        if not self.positional_bias and not self.pos_embed_t_adaln:
+        if not self.positional_bias and not self.pos_embed_t_adaln and self.temporal_pos is None:
             position_embeddings = self.pos_emb[:, None, t0:t0 + t, :]
             x = x + position_embeddings
 
@@ -5484,6 +5501,22 @@ class DLPDecoder(nn.Module):
                                return_alpha_masks=return_alpha_masks)
 
 
+TEMPORAL_POS_MODES = ('abs_adaln', 'rel_bias', 'none')
+
+
+def resolve_temporal_pos(temporal_pos, pos_embed_t_adaln):
+    """
+    Map the temporal_pos config value to (pos_embed_t_adaln, transformer temporal_pos).
+    'abs_adaln' (default) keeps the original absolute per-timestep AdaLN embedding unchanged; 'rel_bias' and 'none'
+    drop it and hand the mode to ParticleSpatioTemporalTransformer (see its temporal_pos).
+    """
+    if temporal_pos not in TEMPORAL_POS_MODES:
+        raise ValueError(f"temporal_pos must be one of {TEMPORAL_POS_MODES}, got {temporal_pos!r}")
+    if temporal_pos == 'abs_adaln':
+        return pos_embed_t_adaln, None
+    return False, temporal_pos
+
+
 class DLPContext(nn.Module):
     def __init__(self, n_kp_enc, dropout=0.1, learned_feature_dim=16, learned_bg_feature_dim=16, embed_init_std=0.02,
                  projection_dim=128, timestep_horizon=1, pte_layers=1, pte_heads=1,
@@ -5512,9 +5545,12 @@ class DLPContext(nn.Module):
                  pos_embed_t_adaln=True,  # pos embeddings for timesteps using adaln
                  pos_embed_p_adaln=True,  # pos embeddings for particles using adaln
                  pos_embed_objon_adaln=False,  # pos embeddings for particles transparency using adaln
-                 particle_pool_adaln=False
+                 particle_pool_adaln=False,
+                 temporal_pos='abs_adaln',  # time position: 'abs_adaln' (original), 'rel_bias' or 'none'
                  ):
         super(DLPContext, self).__init__()
+        pos_embed_t_adaln, self.pte_temporal_pos = resolve_temporal_pos(temporal_pos, pos_embed_t_adaln)
+        self.temporal_pos = temporal_pos
         """
         This module takes in temporal sequence of particles and outputs latent context,
         which can be per-particle, or global, depending on the pooling type.
@@ -5757,7 +5793,8 @@ class DLPContext(nn.Module):
                                                      residual_modulation=pte_context_cond,
                                                      context_gate=pte_context_cond,
                                                      cond_cross_attn=cross_attn,
-                                                     pos_embed_t_adaln=self.pos_embed_t_adaln)
+                                                     pos_embed_t_adaln=self.pos_embed_t_adaln,
+                                                     temporal_pos=self.pte_temporal_pos)
 
         if self.global_ctx_pool:
             # global
@@ -6259,8 +6296,13 @@ class DLPDynamics(nn.Module):
                  # language_condition=False,  # condition on language embedding
                  # language_embed_dim=0,  # embedding dimension for each token
                  # language_max_len=64,  # maximum tokens per prompt
+                 temporal_pos='abs_adaln',  # time position: 'abs_adaln' (original), 'rel_bias' or 'none'
                  ):
         super(DLPDynamics, self).__init__()
+        if temporal_pos != 'abs_adaln' and positional_bias:
+            raise ValueError("temporal_pos replaces positional_bias in the dynamics; leave positional_bias False")
+        pos_embed_t_adaln, self.pt_temporal_pos = resolve_temporal_pos(temporal_pos, pos_embed_t_adaln)
+        self.temporal_pos = temporal_pos
         """
         Args:
         features_dim (int): Dimension of visual features.
@@ -6425,7 +6467,8 @@ class DLPDynamics(nn.Module):
                                                                       context_cond=(self.ctx_mode == 'adaln'),
                                                                       residual_modulation=residual_modulation,
                                                                       context_gate=context_gate,
-                                                                      pos_embed_t_adaln=self.pos_embed_t_adaln)
+                                                                      pos_embed_t_adaln=self.pos_embed_t_adaln,
+                                                                      temporal_pos=self.pt_temporal_pos)
 
         self.particle_decoder = ParticleFeatureDecoderDyn(self.projection_dim, features_dim, bg_features_dim,
                                                           hidden_dim, kp_activation=kp_activation, max_delta=max_delta,

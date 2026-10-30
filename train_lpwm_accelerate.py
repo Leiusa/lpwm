@@ -294,6 +294,7 @@ def train_ddlp(config_path='./configs/balls.json'):
                 language_embed_dim=language_embed_dim,  # embedding dimension for each token
                 language_max_len=language_max_len,  # maximum tokens per prompt
                 img_goal_condition=img_goal_condition,  # condition the future on image goal
+                temporal_pos=config.get('temporal_pos', 'abs_adaln'),  # time position (opt-in, see models.py)
                 # opt-in optimization (default off = original path)
                 fused_composite=fused_composite,
                 )
@@ -331,7 +332,7 @@ def train_ddlp(config_path='./configs/balls.json'):
     # compile the DDP-wrapped model (Dynamo splits the graph at DDP's gradient buckets); `model` stays uncompiled
     # for validation, plotting and checkpoints, as in train_lpwm.py
     train_model = model if compile_mode is None else compile_for_training(model, compile_mode)
-    path_info = (f"STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {fused_composite}"
+    path_info = (f"temporal_pos: {config.get('temporal_pos', 'abs_adaln')} | STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {fused_composite}"
                  f" | seed: {seed} | log_step_timing: {log_step_timing}"
                  f" | torch_compile: {compile_mode}"
                  f" | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"
