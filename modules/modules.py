@@ -254,15 +254,72 @@ class SimpleRelativePositionalBias(nn.Module):
         return t, p
 
 
+class TemporalRotary(nn.Module):
+    """
+    Learned rotary time position for a temporal attention (opt-in, see CausalParticleSelfAttention temporal_rope).
+    Per head, the head dims are split into hs/2 pairs, each rotated by angle theta * p (p = time position):
+      q, k:  rotated by theta_qk * p              -> q_i . k_j depends on content and on the offset p_i - p_j
+      v:     (v + carrier) rotated by theta_v * p, and the attention output rotated back by -theta_v * p_query
+             -> each value reaches the output rotated by -theta_v * (p_query - p_key): the output carries how old
+                the information is (the carrier is a learned constant, so its rotation is a pure age tag)
+    Everything depends only on time offsets, so rotated keys/values in a kv cache stay valid as the window moves.
+    theta_qk, theta_v and carrier are initialized to 0: the rotations are the identity and the layer computes exactly
+    what it computed without them (fine-tuning a temporal_pos 'rel_bias' / 'none' model starts from that model).
+    """
+
+    def __init__(self, n_head, head_dim):
+        super().__init__()
+        if head_dim % 2 != 0:
+            raise ValueError(f"temporal_rope needs an even head dim, got {head_dim}")
+        self.theta_qk = nn.Parameter(torch.zeros(n_head, head_dim // 2))
+        self.theta_v = nn.Parameter(torch.zeros(n_head, head_dim // 2))
+        self.carrier = nn.Parameter(torch.zeros(n_head, head_dim))
+
+    @staticmethod
+    def rotate(x, theta, pos, inverse=False):
+        # x: (B, nh, L, hs); theta: (nh, hs / 2); pos: (L,) time position of each row. Angles in fp32.
+        ang = theta.float()[:, None, :] * pos.float()[None, :, None]  # (nh, L, hs / 2)
+        if inverse:
+            ang = -ang
+        cos, sin = ang.cos().to(x.dtype), ang.sin().to(x.dtype)
+        x1, x2 = x.chunk(2, dim=-1)
+        return torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+
+    def qkv(self, q, k, v, pos):
+        # q, k, v: (B, nh, L, hs) at time positions pos -> rotated q, k, v (v with the carrier)
+        v = v + self.carrier.to(v.dtype)[None, :, None, :]
+        return (self.rotate(q, self.theta_qk, pos), self.rotate(k, self.theta_qk, pos),
+                self.rotate(v, self.theta_v, pos))
+
+    def out(self, y, pos):
+        # attention output (B, nh, L, hs) of the queries at pos, rotated back
+        return self.rotate(y, self.theta_v, pos, inverse=True)
+
+
 class CausalParticleSelfAttention(nn.Module):
     """
     A particle-based multi-head masked self-attention layer with a projection at the end.
     """
 
     def __init__(self, n_embed, n_head, block_size, attn_pdrop=0.1, resid_pdrop=0.1,
-                 positional_bias=False, max_particles=None, linear_bias=False, torch_attn=False):
+                 positional_bias=False, max_particles=None, linear_bias=False, torch_attn=False,
+                 temporal_window=None, temporal_rope=False):
+        # temporal_window (opt-in, default None = full causal): each timestep attends only to itself and the
+        # temporal_window - 1 timesteps before it (banded causal mask)
+        # temporal_rope (opt-in, default False): learned rotary time position on q, k and v (TemporalRotary)
         super().__init__()
         assert n_embed % n_head == 0
+        if temporal_window is not None:
+            if not 1 <= temporal_window <= block_size:
+                raise ValueError(f"temporal_window must be in [1, block_size={block_size}], got {temporal_window}")
+            if torch_attn:
+                raise ValueError("temporal_window needs the manual attention path (torch_attn=False)")
+        if not isinstance(temporal_rope, bool):
+            raise ValueError(f"temporal_rope must be a bool, got {temporal_rope!r}")
+        if temporal_rope and torch_attn:
+            raise ValueError("temporal_rope needs the manual attention path (torch_attn=False)")
+        self.rope = TemporalRotary(n_head, n_embed // n_head) if temporal_rope else None
+        self.temporal_window = temporal_window
         self.attn_pdrop = attn_pdrop
         self.resid_pdrop = resid_pdrop
         self.torch_attn = torch_attn
@@ -277,8 +334,10 @@ class CausalParticleSelfAttention(nn.Module):
 
         self.resid_drop = nn.Dropout(resid_pdrop)
         # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("mask", torch.tril(torch.ones(block_size, block_size))
-                             .view(1, 1, 1, block_size, 1, block_size))
+        mask = torch.tril(torch.ones(block_size, block_size))
+        if temporal_window is not None:
+            mask = mask - torch.tril(torch.ones(block_size, block_size), diagonal=-temporal_window)
+        self.register_buffer("mask", mask.view(1, 1, 1, block_size, 1, block_size))
         self.n_head = n_head
         self.positional_bias = positional_bias
         self.max_particles = max_particles
@@ -296,6 +355,11 @@ class CausalParticleSelfAttention(nn.Module):
 
         if kv is not None:
             return self._forward_cached(q, k, v, kv)
+
+        if self.rope is not None:
+            # row n * T + t of the flattened sequence is timestep t
+            pos = torch.arange(T, device=x.device).repeat(N)
+            q, k, v = self.rope.qkv(q, k, v, pos)
 
         if self.torch_attn:
             y = F.scaled_dot_product_attention(query=q, key=k, value=v, is_causal=True,
@@ -321,6 +385,9 @@ class CausalParticleSelfAttention(nn.Module):
             att = self.attn_drop(att)
             y = att @ v  # (B, nh, N*T, N*T) x (B, nh, N*T, hs) -> (B, nh, N*T, hs)
 
+        if self.rope is not None:
+            y = self.rope.out(y, pos)
+
         y = y.transpose(1, 2).contiguous().view(B, N * T, C)  # re-assemble all head outputs side by side
 
         # output projection
@@ -335,6 +402,13 @@ class CausalParticleSelfAttention(nn.Module):
         # Temporal attention only (one particle per sequence, as SpatioTemporalBlock calls it).
         B, nh, T, hs = q.shape
         assert not self.torch_attn and not self.training, "kv cache: inference with the manual attention path only"
+        if self.rope is not None:
+            # rotate the new rows at their position in this cache's sequence (kv['p'] counts every timestep fed,
+            # also those a sliding cache has dropped); only offsets matter, so the cached rows stay valid
+            p0 = kv.get('p', 0)
+            pos = torch.arange(p0, p0 + T, device=q.device)
+            kv['p'] = p0 + T
+            q, k, v = self.rope.qkv(q, k, v, pos)
         if kv.get('k') is not None:
             k = torch.cat([kv['k'], k], dim=2)
             v = torch.cat([kv['v'], v], dim=2)
@@ -352,6 +426,8 @@ class CausalParticleSelfAttention(nn.Module):
         att = att.masked_fill(self.mask[0, 0, 0, T_past:T_all, 0, :T_all] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         y = att @ v  # (B, nh, T, hs)
+        if self.rope is not None:
+            y = self.rope.out(y, pos)
         y = y.transpose(1, 2).contiguous().view(B, T, nh * hs)
         y = self.proj(y)
         return y.view(B, 1, T, -1)
@@ -558,7 +634,8 @@ class CausalBlock(nn.Module):
 
     def __init__(self, n_embed, n_head, block_size, attn_pdrop=0.1, resid_pdrop=0.1, hidden_dim_multiplier=4,
                  positional_bias=False, activation='gelu', max_particles=None, norm_type='rms', context_cond=False,
-                 residual_modulation=False, context_gate=False, attn_scale=1.0):
+                 residual_modulation=False, context_gate=False, attn_scale=1.0, temporal_window=None,
+                 temporal_rope=False):
         super().__init__()
         self.max_particles = max_particles
         if norm_type == 'rms':
@@ -570,7 +647,8 @@ class CausalBlock(nn.Module):
         self.ln1 = norm_layer(n_embed)
         self.ln2 = norm_layer(n_embed)
         self.attn = CausalParticleSelfAttention(n_embed, n_head, block_size, attn_pdrop, resid_pdrop,
-                                                positional_bias=positional_bias, max_particles=max_particles)
+                                                positional_bias=positional_bias, max_particles=max_particles,
+                                                temporal_window=temporal_window, temporal_rope=temporal_rope)
         self.mlp = MLP(n_embed, resid_pdrop, hidden_dim_multiplier, activation=activation)
         self.attn_scale = attn_scale
         self.context_cond = context_cond
@@ -613,12 +691,19 @@ class SpatioTemporalBlock(nn.Module):
     def __init__(self, n_embed, n_head, block_size, attn_pdrop=0.1, resid_pdrop=0.1, hidden_dim_multiplier=4,
                  positional_bias=False, activation='gelu', max_particles=None, norm_type='rms', causal=True,
                  context_cond=False, residual_modulation=True, context_gate=False, attn_scale=1.0,
-                 cross_attn_cond=False, attention_order=('spatial', 'temporal'), temporal_bias=False):
+                 cross_attn_cond=False, attention_order=('spatial', 'temporal'), temporal_bias=False,
+                 temporal_window=None, temporal_rope=False):
         # temporal_bias (opt-in, default off): learned relative time bias in the temporal attention only (one scalar
         # per head per frame offset); the spatial block is left as it is. Exclusive with positional_bias.
+        # temporal_window (opt-in, default None): banded causal mask in the temporal attention (causal only)
         super().__init__()
         if temporal_bias and positional_bias:
             raise ValueError("temporal_bias and positional_bias are exclusive")
+        if temporal_window is not None and not causal:
+            raise ValueError("temporal_window needs a causal temporal block")
+        # temporal_rope (opt-in, default False): learned rotary time position in the temporal attention (TemporalRotary)
+        if temporal_rope and not causal:
+            raise ValueError("temporal_rope needs a causal temporal block")
         self.context_cond = context_cond
         self.residual_modulation = residual_modulation
         self.context_gate = context_gate
@@ -637,13 +722,16 @@ class SpatioTemporalBlock(nn.Module):
                                       attn_scale=attn_scale)
         temp_block_type = CausalBlock if self.causal else SelfBlock
         # temporal_bias: time offsets only (max_particles=None), each temporal sequence holds one particle
+        window_kw = {} if temporal_window is None else {'temporal_window': temporal_window}
+        if temporal_rope:
+            window_kw['temporal_rope'] = True
         self.temp_block = temp_block_type(n_embed, n_head, block_size, attn_pdrop,
                                           resid_pdrop, hidden_dim_multiplier,
                                           positional_bias or temporal_bias, activation=activation,
                                           max_particles=None if temporal_bias else max_particles,
                                           norm_type=norm_type, context_cond=context_cond,
                                           residual_modulation=residual_modulation, context_gate=context_gate,
-                                          attn_scale=attn_scale)
+                                          attn_scale=attn_scale, **window_kw)
         if self.cross_attn_cond:
             self.cross_block = CrossBlock(n_embed, n_head, spatio_block_size, attn_pdrop,
                                           resid_pdrop, hidden_dim_multiplier, positional_bias, activation=activation,
@@ -820,7 +908,9 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                  attention_order=('spatial', 'temporal'), cond_cross_attn=False,
                  token_pool_adaln=False,
                  pos_embed_t_adaln=False,
-                 temporal_pos=None
+                 temporal_pos=None,
+                 temporal_window=None,
+                 temporal_rope=False
                  ):
         # temporal_pos (opt-in): None keeps the original behaviour, set by positional_bias / pos_embed_t_adaln.
         #   'rel_bias': no per-timestep embedding; a learned relative time bias in the temporal attention logits,
@@ -831,6 +921,27 @@ class ParticleSpatioTemporalTransformer(nn.Module):
             raise ValueError(f"temporal_pos must be None, 'rel_bias' or 'none', got {temporal_pos!r}")
         if temporal_pos is not None and (positional_bias or pos_embed_t_adaln):
             raise ValueError("temporal_pos replaces positional_bias / pos_embed_t_adaln; set those to False")
+        # temporal_window (opt-in, default None): banded causal temporal attention (each timestep sees itself and the
+        # temporal_window - 1 before it). Train on clips longer than the window; at inference a sliding kv cache of
+        # temporal_window timesteps then computes exactly what training computed. Needs temporal_pos 'rel_bias' or
+        # 'none' (no per-timestep embedding: the same frame gets the same keys/values wherever it sits).
+        if temporal_window is not None:
+            if temporal_pos not in ('rel_bias', 'none'):
+                raise ValueError("temporal_window needs temporal_pos 'rel_bias' or 'none'")
+            if not causal:
+                raise ValueError("temporal_window needs a causal transformer")
+        # temporal_rope (opt-in, default False): learned rotary time position on the temporal q, k, v (TemporalRotary).
+        # Depends only on time offsets like 'rel_bias', so it needs temporal_pos 'rel_bias' / 'none' (no absolute
+        # embedding) and keeps the sliding kv cache valid. Zero-initialized: adding it to a trained model changes nothing.
+        if not isinstance(temporal_rope, bool):
+            raise ValueError(f"temporal_rope must be a bool, got {temporal_rope!r}")
+        if temporal_rope:
+            if temporal_pos not in ('rel_bias', 'none'):
+                raise ValueError("temporal_rope needs temporal_pos 'rel_bias' or 'none'")
+            if not causal:
+                raise ValueError("temporal_rope needs a causal transformer")
+        self.temporal_rope = temporal_rope
+        self.temporal_window = temporal_window
         self.temporal_pos = temporal_pos
         self.positional_bias = positional_bias
         self.max_particles = max_particles  # for positional bias
@@ -884,7 +995,9 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                                                           context_gate=context_gate, attn_scale=self.attn_scale,
                                                           attention_order=self.attention_order,
                                                           cross_attn_cond=self.cond_cross_attn,
-                                                          temporal_bias=(temporal_pos == 'rel_bias'))
+                                                          temporal_bias=(temporal_pos == 'rel_bias'),
+                                                          temporal_window=temporal_window,
+                                                          temporal_rope=temporal_rope)
                                       for _ in range(n_layer)])
 
         # decoder head
@@ -898,9 +1011,20 @@ class ParticleSpatioTemporalTransformer(nn.Module):
     def get_block_size(self):
         return self.block_size
 
-    def new_kv_cache(self):
+    def new_kv_cache(self, slide=False, window=None):
         # per-layer key/value cache of the temporal attention, filled by forward(..., kv_cache=)
-        return {'t': 0, 'layers': [{} for _ in self.blocks]}
+        # slide=True: once the cache holds `window` timesteps (default block_size), forward drops the oldest ones to
+        # make room for the new ones instead of failing. Needs keys/values that carry no absolute timestep, so only
+        # temporal_pos 'rel_bias' / 'none'. window: the caller's window (DLPDynamics.sample uses the dynamics block
+        # size for both transformers; the context transformer's own block size can be larger).
+        if slide and self.temporal_pos not in ('rel_bias', 'none'):
+            raise ValueError("sliding kv cache needs temporal_pos 'rel_bias' or 'none' "
+                             f"(got {self.temporal_pos!r}: cached keys/values carry the absolute timestep)")
+        if window is None:
+            window = self.block_size if self.temporal_window is None else self.temporal_window
+        if not 0 < window <= self.block_size:
+            raise ValueError(f"kv cache window must be in [1, block_size={self.block_size}], got {window}")
+        return {'t': 0, 'slide': slide, 'window': window, 'layers': [{} for _ in self.blocks]}
 
     def init_weights(self):
         # initialize layers
@@ -953,6 +1077,16 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                     n_c = c.shape[1]
         # n is the number of particles
         t0 = 0 if kv_cache is None else kv_cache['t']  # absolute timestep of the first row of x
+        if kv_cache is not None and kv_cache.get('slide') and t0 + t > kv_cache['window']:
+            # sliding cache: keep the newest window - t cached timesteps, so the new ones see the same
+            # window frames as a recomputed window. Approximation: in layers after the first, the kept
+            # keys/values were computed while the dropped (older) frames were still visible.
+            keep = kv_cache['window'] - t
+            assert keep >= 0, "sliding kv cache: more new timesteps than the window"
+            for kv in kv_cache['layers']:
+                kv['k'] = kv['k'].narrow(2, kv['k'].shape[2] - keep, keep)
+                kv['v'] = kv['v'].narrow(2, kv['v'].shape[2] - keep, keep)
+            t0 = keep  # window position of the first new row (no absolute position is used in this mode)
         assert t0 + t <= self.block_size, "Cannot forward, model block size is exhausted."
         assert f == self.n_embed, "invalid particle feature dim"
 
@@ -5547,8 +5681,12 @@ class DLPContext(nn.Module):
                  pos_embed_objon_adaln=False,  # pos embeddings for particles transparency using adaln
                  particle_pool_adaln=False,
                  temporal_pos='abs_adaln',  # time position: 'abs_adaln' (original), 'rel_bias' or 'none'
+                 temporal_window=None,  # opt-in banded temporal attention, see ParticleSpatioTemporalTransformer
+                 temporal_rope=False,  # opt-in rotary time position, see ParticleSpatioTemporalTransformer
                  ):
         super(DLPContext, self).__init__()
+        self.temporal_window = temporal_window
+        self.temporal_rope = temporal_rope
         pos_embed_t_adaln, self.pte_temporal_pos = resolve_temporal_pos(temporal_pos, pos_embed_t_adaln)
         self.temporal_pos = temporal_pos
         """
@@ -5794,7 +5932,9 @@ class DLPContext(nn.Module):
                                                      context_gate=pte_context_cond,
                                                      cond_cross_attn=cross_attn,
                                                      pos_embed_t_adaln=self.pos_embed_t_adaln,
-                                                     temporal_pos=self.pte_temporal_pos)
+                                                     temporal_pos=self.pte_temporal_pos,
+                                                     temporal_window=self.temporal_window,
+                                                     temporal_rope=self.temporal_rope)
 
         if self.global_ctx_pool:
             # global
@@ -6297,6 +6437,8 @@ class DLPDynamics(nn.Module):
                  # language_embed_dim=0,  # embedding dimension for each token
                  # language_max_len=64,  # maximum tokens per prompt
                  temporal_pos='abs_adaln',  # time position: 'abs_adaln' (original), 'rel_bias' or 'none'
+                 temporal_window=None,  # opt-in banded temporal attention, see ParticleSpatioTemporalTransformer
+                 temporal_rope=False,  # opt-in rotary time position, see ParticleSpatioTemporalTransformer
                  ):
         super(DLPDynamics, self).__init__()
         if temporal_pos != 'abs_adaln' and positional_bias:
@@ -6468,7 +6610,9 @@ class DLPDynamics(nn.Module):
                                                                       residual_modulation=residual_modulation,
                                                                       context_gate=context_gate,
                                                                       pos_embed_t_adaln=self.pos_embed_t_adaln,
-                                                                      temporal_pos=self.pt_temporal_pos)
+                                                                      temporal_pos=self.pt_temporal_pos,
+                                                                      temporal_window=temporal_window,
+                                                                      temporal_rope=temporal_rope)
 
         self.particle_decoder = ParticleFeatureDecoderDyn(self.projection_dim, features_dim, bg_features_dim,
                                                           hidden_dim, kp_activation=kp_activation, max_delta=max_delta,
@@ -6506,10 +6650,14 @@ class DLPDynamics(nn.Module):
             steps (int): Number of forward sampling steps. Defaults to 10.
             deterministic (bool): If True, the sampling is deterministic. Defaults to False.
             deterministic_particles (bool): If True, uses deterministic particles during sampling. Defaults to True.
-            kv_cache (bool): If True, the context and dynamics transformers keep the keys/values of the earlier
-                timesteps and run only on the new ones. Exact while the sequence fits in the block size; once it
-                is longer, each step recomputes the last block_size timesteps as without the cache (the window
-                slides, so cached keys/values no longer hold). Defaults to False.
+            kv_cache (bool or str): If True, the context and dynamics transformers keep the keys/values of the
+                earlier timesteps and run only on the new ones. Exact while the sequence fits in the block size; once
+                it is longer, each step recomputes the last block_size timesteps as without the cache (the window
+                slides, so cached keys/values no longer hold). 'slide' (opt-in, temporal_pos 'rel_bias' / 'none'
+                only): same while the sequence fits; once it is longer, the oldest cached timestep is dropped and
+                only the new one is run. Not exact past the block size: in layers after the first, the kept
+                keys/values were computed while frames that have left the window were still visible.
+                Defaults to False.
 
         Returns:
             dict: A dictionary containing sampled outputs:
@@ -6528,6 +6676,10 @@ class DLPDynamics(nn.Module):
             - Quadratic complexity is involved in the sampling process due to the block size and transformer operations.
         """
         block_size = self.particle_transformer.get_block_size()
+        if self.particle_transformer.temporal_window is not None:
+            # banded model: the dynamics sees at most temporal_window timesteps per layer, so the window that slides
+            # (or is recomputed) is temporal_window
+            block_size = self.particle_transformer.temporal_window
         # z, z_scale: [bs, T, n_particles, 2]
         # z_depth, z_obj_on: [bs, T, n_particles, 1]
         # z_features: [bs, T, n_particles, in_features_dim]
@@ -6539,6 +6691,9 @@ class DLPDynamics(nn.Module):
         mu_context_posterior = z_context_posterior = z_context  # initialize in case they are needed
         bs, timestep_horizon, n_particles, _ = z.shape
         ctx_cache = dyn_cache = None
+        if kv_cache not in (False, True, 'slide'):
+            raise ValueError(f"kv_cache must be False, True or 'slide', got {kv_cache!r}")
+        slide = kv_cache == 'slide'
         if kv_cache:
             assert not self.training, "kv_cache is for inference"
             assert not return_context_posterior, "kv_cache: return_context_posterior is not supported"
@@ -6547,16 +6702,18 @@ class DLPDynamics(nn.Module):
                 ctx = self.context_decoder
                 assert not ctx.random_action_condition, "kv_cache: random actions are redrawn for every timestep"
                 assert not (ctx.img_goal_condition and z_goal is None), "kv_cache: pass z_goal"
-                ctx_cache = ctx.pte.new_kv_cache()
-            dyn_cache = self.particle_transformer.new_kv_cache()
+                # same window for both: the context transformer's block size can be larger (horizon + 1)
+                ctx_cache = ctx.pte.new_kv_cache(slide=slide, window=block_size if slide else None)
+            dyn_cache = self.particle_transformer.new_kv_cache(slide=slide)
         for k in range(steps):
             start_step = max(z.shape[1] - block_size, 0)
             end_step = min(start_step + block_size, z.shape[1])
-            if start_step > 0:
+            if start_step > 0 and not slide:
                 ctx_cache = dyn_cache = None  # the window slides: recompute it, as without the cache
             # first timestep each module runs on: start_step, or the first one not yet in its cache
-            ctx_lo = start_step if ctx_cache is None else ctx_cache['t']
-            dyn_lo = start_step if dyn_cache is None else dyn_cache['t']
+            # ('end': index in z after the last cached timestep, set below)
+            ctx_lo = start_step if ctx_cache is None or 'end' not in ctx_cache else ctx_cache['end']
+            dyn_lo = start_step if dyn_cache is None or 'end' not in dyn_cache else dyn_cache['end']
             # first generate context, then use the context with the current particles
             if self.context_dim > 0:
                 # check if context was provided
@@ -6585,6 +6742,8 @@ class DLPDynamics(nn.Module):
                                                        lang_embed=lang_embed,
                                                        z_goal=z_goal,
                                                        kv_cache=ctx_cache)
+                    if ctx_cache is not None:
+                        ctx_cache['end'] = end_step
                     z_context_last = ctx_dec_out['z_context_dyn'][:, -1:]
 
                     new_z_context = z_context_last
@@ -6708,6 +6867,8 @@ class DLPDynamics(nn.Module):
                 c = c + c_objon
 
             particles_trans = self.particle_transformer(particle_proj_int, c, kv_cache=dyn_cache)
+            if dyn_cache is not None:
+                dyn_cache['end'] = end_step
             if self.n_views > 1:
                 # [bs, n_views * n, T, d] -> [bs * n_views, n, T, d]
                 particles_trans = particles_trans.reshape(bs, -1, *particles_trans.shape[2:])

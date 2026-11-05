@@ -139,6 +139,12 @@ class DLP(nn.Module):
                  # time position of the context/dynamics transformers: 'abs_adaln' (original, per-timestep AdaLN
                  # embedding), 'rel_bias' (relative time bias in the temporal attention) or 'none'
                  temporal_pos='abs_adaln',
+                 # opt-in banded temporal attention of the context/dynamics transformers (None = full causal):
+                 # each timestep sees itself and the temporal_window - 1 before it; needs temporal_pos 'rel_bias'/'none'
+                 temporal_window=None,
+                 # opt-in learned rotary time position (q, k, v) in the temporal attention of the context/dynamics
+                 # transformers; zero-initialized; needs temporal_pos 'rel_bias'/'none' (sliding kv cache stays valid)
+                 temporal_rope=False,
                  ):
         super(DLP, self).__init__()
         """
@@ -354,6 +360,24 @@ class DLP(nn.Module):
         if temporal_pos != 'abs_adaln' and not self.is_dynamics_model:
             raise ValueError("temporal_pos only applies to dynamics models (timestep_horizon > 1)")
         self.temporal_pos = temporal_pos
+        if temporal_window is not None:
+            if not self.is_dynamics_model:
+                raise ValueError("temporal_window only applies to dynamics models (timestep_horizon > 1)")
+            if temporal_pos == 'abs_adaln':
+                raise ValueError("temporal_window needs temporal_pos 'rel_bias' or 'none'")
+            if isinstance(temporal_window, bool) or not isinstance(temporal_window, int) \
+                    or not 1 <= temporal_window <= timestep_horizon:
+                raise ValueError(f"temporal_window must be an int in [1, timestep_horizon={timestep_horizon}], "
+                                 f"got {temporal_window!r}")
+        self.temporal_window = temporal_window
+        if not isinstance(temporal_rope, bool):
+            raise ValueError(f"temporal_rope must be a bool, got {temporal_rope!r}")
+        if temporal_rope:
+            if not self.is_dynamics_model:
+                raise ValueError("temporal_rope only applies to dynamics models (timestep_horizon > 1)")
+            if temporal_pos == 'abs_adaln':
+                raise ValueError("temporal_rope needs temporal_pos 'rel_bias' or 'none'")
+        self.temporal_rope = temporal_rope
         # global latent context: EXPERIMENTAL, NOT USED IN THE PAPER
         self.global_ctx_pool = global_ctx_pool
         self.pool_ctx_dim = pool_ctx_dim
@@ -520,6 +544,8 @@ class DLP(nn.Module):
                                          language_max_len=self.language_max_len,  # maximum tokens per prompt
                                          img_goal_condition=self.img_goal_condition,
                                          temporal_pos=temporal_pos,
+                                         temporal_window=temporal_window,
+                                         temporal_rope=temporal_rope,
                                          )
             self.encoder_module.ctx_enc = self.ctx_module
         else:
@@ -584,6 +610,8 @@ class DLP(nn.Module):
                                                   self.learn_null_action_embed and not self.action_in_ctx_module),
                                           # learn a "no-input-action" embedding, to learn on action-free videos as well
                                           temporal_pos=temporal_pos,
+                                          temporal_window=temporal_window,
+                                          temporal_rope=temporal_rope,
                                           )
         else:
             self.dyn_module = nn.Identity()
@@ -891,7 +919,7 @@ class DLP(nn.Module):
         # use_all_ctx: if True, will encode context from the entire trajectory to condition the prediction
         # this is meant to see if the model is able to follow conditions and reconstruct stochastic trajectories
         # that involve latent stochastic actions
-        # kv_cache: inference speed-up of the dynamics unroll, see DLPDynamics.sample
+        # kv_cache: inference speed-up of the dynamics unroll (False / True / 'slide'), see DLPDynamics.sample
         # x: [bs, T, ...]
         assert self.is_dynamics_model, f"model timesteps: {self.timestep_horizon} -> non-dynamics model"
         # encode-decode
