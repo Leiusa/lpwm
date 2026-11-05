@@ -62,7 +62,7 @@ python generate_lpwm_video_prediction.py --help
 
 ## 工作流程（多账号协作）
 
-本目录由两个 Claude 账号（`claude-lab` / `claude-me`）轮流使用。**项目进度以 Notion 为准，不依赖对话历史。**
+本目录由两个 Claude 账号（实验室共享账号 / 个人账号）轮流使用，用同一个 `claude` 配置目录，切换时 `/logout` 再 `/login`。**项目进度以 Notion 为准，不依赖对话历史。**
 
 Notion 页面（通过项目级 Notion MCP 访问）：
 - 项目根页面：[LPWM Acceleration Research](https://app.notion.com/p/407360a2828a81a39089ed34cefab74b)
