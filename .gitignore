@@ -2,3 +2,37 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+
+# --- OS / editor ---
+.DS_Store
+.ipynb_checkpoints/
+
+# --- secrets / env ---
+.env
+.env.*
+*.pem
+*.key
+.claude/settings.local.json
+
+# --- checkpoints & model weights ---
+checkpoints/*
+!checkpoints/PUT_CKPTS_HERE.txt
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+!tests/**/fixtures/*.pt
+!eval/lpips/vgg.pth
+
+# --- data files ---
+*.h5
+*.hdf5
+*.npz
+*.tfrecord*
+
+# --- logs / outputs ---
+logs/
+runs/
+wandb/
+outputs/
+*.log
