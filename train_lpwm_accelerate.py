@@ -297,6 +297,8 @@ def train_ddlp(config_path='./configs/balls.json'):
                 temporal_pos=config.get('temporal_pos', 'abs_adaln'),  # time position (opt-in, see models.py)
                 temporal_window=config.get('temporal_window', None),  # banded temporal attention (opt-in)
                 temporal_rope=config.get('temporal_rope', False),  # rotary time position (opt-in)
+                temporal_vgain=config.get('temporal_vgain', False),  # per-offset value gain (opt-in)
+                temporal_memory=config.get('temporal_memory', False),  # recurrent memory (opt-in)
                 # opt-in optimization (default off = original path)
                 fused_composite=fused_composite,
                 )
@@ -334,7 +336,7 @@ def train_ddlp(config_path='./configs/balls.json'):
     # compile the DDP-wrapped model (Dynamo splits the graph at DDP's gradient buckets); `model` stays uncompiled
     # for validation, plotting and checkpoints, as in train_lpwm.py
     train_model = model if compile_mode is None else compile_for_training(model, compile_mode)
-    path_info = (f"temporal_pos: {config.get('temporal_pos', 'abs_adaln')} | temporal_window: {config.get('temporal_window', None)} | temporal_rope: {config.get('temporal_rope', False)} | STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {fused_composite}"
+    path_info = (f"temporal_pos: {config.get('temporal_pos', 'abs_adaln')} | temporal_window: {config.get('temporal_window', None)} | temporal_rope: {config.get('temporal_rope', False)} | temporal_vgain: {config.get('temporal_vgain', False)} | temporal_memory: {config.get('temporal_memory', False)} | STN backend: {lpwm_stn.get_backend_name()} | fused_composite: {fused_composite}"
                  f" | seed: {seed} | log_step_timing: {log_step_timing}"
                  f" | torch_compile: {compile_mode}"
                  f" | tf32_matmul: {torch.backends.cuda.matmul.allow_tf32}"

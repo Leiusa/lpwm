@@ -6,6 +6,7 @@ import math
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint
 from torch.nn import functional as F
 from torch.distributions import Beta
 from lpwm_stn import create_masks_fast, create_masks_with_scale, stn_crop, stn_paste
@@ -254,6 +255,12 @@ class SimpleRelativePositionalBias(nn.Module):
         return t, p
 
 
+def check_temporal_rope(temporal_rope):
+    # temporal_rope: False (off), True (zero init, fine-tuning) or 'freq' (frequency init, training from scratch)
+    if not (isinstance(temporal_rope, bool) or temporal_rope == 'freq'):
+        raise ValueError(f"temporal_rope must be False, True or 'freq', got {temporal_rope!r}")
+
+
 class TemporalRotary(nn.Module):
     """
     Learned rotary time position for a temporal attention (opt-in, see CausalParticleSelfAttention temporal_rope).
@@ -263,17 +270,35 @@ class TemporalRotary(nn.Module):
              -> each value reaches the output rotated by -theta_v * (p_query - p_key): the output carries how old
                 the information is (the carrier is a learned constant, so its rotation is a pure age tag)
     Everything depends only on time offsets, so rotated keys/values in a kv cache stay valid as the window moves.
-    theta_qk, theta_v and carrier are initialized to 0: the rotations are the identity and the layer computes exactly
-    what it computed without them (fine-tuning a temporal_pos 'rel_bias' / 'none' model starts from that model).
+    init 'zero' (temporal_rope=True): theta_qk, theta_v and carrier are 0, the rotations are the identity and the layer
+    computes exactly what it computed without them (fine-tuning a temporal_pos 'rel_bias' / 'none' model starts from
+    that model). init 'freq' (temporal_rope='freq', for training from scratch): theta_qk and theta_v start at
+    frequencies log-spaced from pi / (block_size - 1) to pi / 2 rad per timestep (every pair turns at least half a turn
+    across the window, so frames at different offsets get differently signed weights from the start), the carrier
+    starts at N(0, 0.02^2), and the output has the carrier subtracted after rotating back, so the carrier adds no
+    constant offset and its age tag has a first-order gradient from step 0.
     """
 
-    def __init__(self, n_head, head_dim):
+    def __init__(self, n_head, head_dim, init='zero', block_size=None):
         super().__init__()
         if head_dim % 2 != 0:
             raise ValueError(f"temporal_rope needs an even head dim, got {head_dim}")
+        if init not in ('zero', 'freq'):
+            raise ValueError(f"TemporalRotary init must be 'zero' or 'freq', got {init!r}")
+        self.init = init
+        self.subtract_carrier = init == 'freq'
         self.theta_qk = nn.Parameter(torch.zeros(n_head, head_dim // 2))
         self.theta_v = nn.Parameter(torch.zeros(n_head, head_dim // 2))
         self.carrier = nn.Parameter(torch.zeros(n_head, head_dim))
+        if init == 'freq':
+            if block_size is None or block_size < 2:
+                raise ValueError(f"temporal_rope 'freq' needs block_size >= 2, got {block_size!r}")
+            freqs = torch.exp(torch.linspace(math.log(math.pi / 2), math.log(math.pi / (block_size - 1)),
+                                             head_dim // 2))
+            with torch.no_grad():
+                self.theta_qk.copy_(freqs.expand(n_head, -1))
+                self.theta_v.copy_(freqs.expand(n_head, -1))
+                self.carrier.normal_(0.0, 0.02)
 
     @staticmethod
     def rotate(x, theta, pos, inverse=False):
@@ -292,8 +317,106 @@ class TemporalRotary(nn.Module):
                 self.rotate(v, self.theta_v, pos))
 
     def out(self, y, pos):
-        # attention output (B, nh, L, hs) of the queries at pos, rotated back
-        return self.rotate(y, self.theta_v, pos, inverse=True)
+        # attention output (B, nh, L, hs) of the queries at pos, rotated back ('freq': minus the carrier)
+        y = self.rotate(y, self.theta_v, pos, inverse=True)
+        if self.subtract_carrier:
+            y = y - self.carrier.to(y.dtype)[None, :, None, :]
+        return y
+
+
+class TemporalValueGain(nn.Module):
+    """
+    Per-offset, per-dimension value gain for a temporal attention (opt-in, see CausalParticleSelfAttention
+    temporal_vgain). With attention weights a_ij (softmax, >= 0) and offset d = t_i - t_j:
+        y_i = sum_j a_ij * (1 + delta[d]) * v_j        (elementwise per head dim)
+    so each offset and each value dim gets its own weight a_ij * (1 + delta[d, c]), which can be negative (e.g. new
+    minus old frames, a velocity estimate from several noisy positions). Computed as
+        y = a @ v + sum_d diag_{-d}(a) * delta[d] * v[shifted by d]
+    delta is initialized to 0: the correction is exactly 0 and the layer computes bitwise what it computed without
+    it; the gradient w.r.t. delta is first-order from the start. Depends only on time offsets, so cached values stay
+    valid as the window moves (the gain is applied when the cache is read, not stored).
+    """
+
+    def __init__(self, n_head, head_dim, block_size):
+        super().__init__()
+        self.block_size = block_size
+        self.delta = nn.Parameter(torch.zeros(n_head, block_size, head_dim))
+
+    def correction(self, att, v):
+        # full sequence: att (B, nh, T, T) causal attention weights, v (B, nh, T, hs) -> (B, nh, T, hs)
+        T = att.shape[-1]
+        if T > self.block_size:
+            raise ValueError(f"temporal_vgain: sequence {T} longer than block_size {self.block_size}")
+        delta = self.delta.to(v.dtype)
+        out = None
+        for d in range(T):
+            a_d = torch.diagonal(att, offset=-d, dim1=-2, dim2=-1)  # (B, nh, T - d): a[i = j + d, j]
+            c_d = a_d[..., None] * (delta[None, :, d, None, :] * v[:, :, :T - d])  # rows i = d .. T - 1
+            c_d = F.pad(c_d, (0, 0, d, 0))  # (B, nh, T, hs), rows 0 .. d - 1 are 0
+            out = c_d if out is None else out + c_d
+        return out
+
+    def correction_cached(self, att, v, q_pos, k_pos):
+        # kv cache: att (B, nh, Tq, Tk), v (B, nh, Tk, hs), q_pos (Tq,), k_pos (Tk,) absolute timestep counters
+        d = (q_pos[:, None] - k_pos[None, :]).clamp(0, self.block_size - 1)  # masked pairs have att = 0
+        g = self.delta.to(v.dtype)[:, d]  # (nh, Tq, Tk, hs)
+        return torch.einsum('bhqk,hqkc,bhkc->bhqc', att, g, v)
+
+
+class TemporalMemory(nn.Module):
+    """
+    Gated delta-rule recurrent memory for a temporal attention (opt-in, see CausalParticleSelfAttention
+    temporal_memory), in the style of Gated DeltaNet / Kimi Delta Attention. Per sequence (one particle slot) and
+    head, a state S (hs x hs) is updated at every timestep from the attention's own q, k, v:
+        S <- alpha_t * S                          (per-key-channel forget gate, alpha_t = sigmoid(W_a x_t) in (0, 1))
+        S <- S - beta_t k_t (k_t^T S)             (delta rule: erase what is stored under k_t)
+        S <- S + beta_t k_t v_t^T                 (write, beta_t = sigmoid(w_b x_t) per head)
+        m_t = S^T q_t                             (read)
+    with q_t, k_t L2-normalized per head. The attention output becomes y + gate * m (gate per head, initialized to 0,
+    so the layer starts bitwise as the attention without memory; its gradient is first-order from the start).
+    Full-sequence forward (training, recompute): the state starts at 0 at the first timestep of the sequence. kv cache:
+    the state is carried in kv['S'] and keeps accumulating over every timestep fed (it is not limited to the window).
+    """
+
+    def __init__(self, n_embed, n_head):
+        super().__init__()
+        self.n_head = n_head
+        self.hs = n_embed // n_head
+        self.alpha = nn.Linear(n_embed, n_embed)  # per head, per key channel
+        self.beta = nn.Linear(n_embed, n_head)
+        nn.init.zeros_(self.alpha.weight)
+        nn.init.constant_(self.alpha.bias, 3.0)  # alpha ~ 0.95 at init: slow forgetting
+        nn.init.zeros_(self.beta.weight)
+        nn.init.zeros_(self.beta.bias)  # beta = 0.5 at init
+        self.gate = nn.Parameter(torch.zeros(n_head))
+
+    def gates(self, x):
+        # x: (B, T, C) tokens of the timesteps -> alpha (B, nh, T, hs), beta (B, nh, T, 1)
+        B, T, _ = x.shape
+        a = torch.sigmoid(self.alpha(x)).view(B, T, self.n_head, self.hs).transpose(1, 2)
+        b = torch.sigmoid(self.beta(x)).view(B, T, self.n_head, 1).transpose(1, 2)
+        return a, b
+
+    def scan(self, q, k, v, a, b, S=None):
+        # q, k, v, a: (B, nh, T, hs); b: (B, nh, T, 1); S: (B, nh, hs, hs) or None -> m (B, nh, T, hs), S
+        q = F.normalize(q.float(), dim=-1)
+        k = F.normalize(k.float(), dim=-1)
+        v, a, b = v.float(), a.float(), b.float()
+        B, nh, T, hs = q.shape
+        if S is None:
+            S = q.new_zeros(B, nh, hs, hs)
+        outs = []
+        for t in range(T):
+            kt, vt, bt = k[:, :, t], v[:, :, t], b[:, :, t]  # (B, nh, hs), (B, nh, hs), (B, nh, 1)
+            S = a[:, :, t, :, None] * S
+            S = S - bt[..., None] * kt[..., :, None] * torch.einsum('bhk,bhkv->bhv', kt, S)[..., None, :]
+            S = S + bt[..., None] * kt[..., :, None] * vt[..., None, :]
+            outs.append(torch.einsum('bhk,bhkv->bhv', q[:, :, t], S))
+        return torch.stack(outs, 2), S
+
+    def combine(self, y, m):
+        # y: attention output (B, nh, T, hs); m: memory read-out -> y + gate * m
+        return y + self.gate.to(y.dtype)[None, :, None, None] * m.to(y.dtype)
 
 
 class CausalParticleSelfAttention(nn.Module):
@@ -303,10 +426,14 @@ class CausalParticleSelfAttention(nn.Module):
 
     def __init__(self, n_embed, n_head, block_size, attn_pdrop=0.1, resid_pdrop=0.1,
                  positional_bias=False, max_particles=None, linear_bias=False, torch_attn=False,
-                 temporal_window=None, temporal_rope=False):
+                 temporal_window=None, temporal_rope=False, temporal_vgain=False, temporal_memory=False):
         # temporal_window (opt-in, default None = full causal): each timestep attends only to itself and the
         # temporal_window - 1 timesteps before it (banded causal mask)
-        # temporal_rope (opt-in, default False): learned rotary time position on q, k and v (TemporalRotary)
+        # temporal_memory (opt-in, default False): gated delta-rule recurrent memory next to the attention
+        #   (TemporalMemory); meant to be used with a short temporal_window
+        # temporal_rope (opt-in, default False): learned rotary time position on q, k and v (TemporalRotary);
+        #   True = zero init (fine-tuning), 'freq' = frequency init + carrier subtraction (training from scratch)
+        # temporal_vgain (opt-in, default False): per-offset per-dimension value gain (TemporalValueGain)
         super().__init__()
         assert n_embed % n_head == 0
         if temporal_window is not None:
@@ -314,11 +441,25 @@ class CausalParticleSelfAttention(nn.Module):
                 raise ValueError(f"temporal_window must be in [1, block_size={block_size}], got {temporal_window}")
             if torch_attn:
                 raise ValueError("temporal_window needs the manual attention path (torch_attn=False)")
-        if not isinstance(temporal_rope, bool):
-            raise ValueError(f"temporal_rope must be a bool, got {temporal_rope!r}")
+        check_temporal_rope(temporal_rope)
         if temporal_rope and torch_attn:
             raise ValueError("temporal_rope needs the manual attention path (torch_attn=False)")
-        self.rope = TemporalRotary(n_head, n_embed // n_head) if temporal_rope else None
+        if not isinstance(temporal_vgain, bool):
+            raise ValueError(f"temporal_vgain must be a bool, got {temporal_vgain!r}")
+        if temporal_vgain and torch_attn:
+            raise ValueError("temporal_vgain needs the manual attention path (torch_attn=False)")
+        if temporal_vgain and temporal_rope:
+            raise ValueError("temporal_vgain and temporal_rope are exclusive")
+        if not isinstance(temporal_memory, bool):
+            raise ValueError(f"temporal_memory must be a bool, got {temporal_memory!r}")
+        if temporal_memory and torch_attn:
+            raise ValueError("temporal_memory needs the manual attention path (torch_attn=False)")
+        if temporal_memory and (temporal_rope or temporal_vgain):
+            raise ValueError("temporal_memory is exclusive with temporal_rope / temporal_vgain")
+        self.rope = TemporalRotary(n_head, n_embed // n_head, init='freq' if temporal_rope == 'freq' else 'zero',
+                                   block_size=block_size) if temporal_rope else None
+        self.vgain = TemporalValueGain(n_head, n_embed // n_head, block_size) if temporal_vgain else None
+        self.memory = TemporalMemory(n_embed, n_head) if temporal_memory else None
         self.temporal_window = temporal_window
         self.attn_pdrop = attn_pdrop
         self.resid_pdrop = resid_pdrop
@@ -354,7 +495,7 @@ class CausalParticleSelfAttention(nn.Module):
         v = self.value(x).view(B, N * T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, N * T, hs)
 
         if kv is not None:
-            return self._forward_cached(q, k, v, kv)
+            return self._forward_cached(q, k, v, kv, x)
 
         if self.rope is not None:
             # row n * T + t of the flattened sequence is timestep t
@@ -384,6 +525,19 @@ class CausalParticleSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_drop(att)
             y = att @ v  # (B, nh, N*T, N*T) x (B, nh, N*T, hs) -> (B, nh, N*T, hs)
+            if self.vgain is not None:
+                if N != 1:
+                    raise ValueError("temporal_vgain: temporal attention only (one particle per sequence)")
+                y = y + self.vgain.correction(att, v)
+            if self.memory is not None:
+                if N != 1:
+                    raise ValueError("temporal_memory: temporal attention only (one particle per sequence)")
+                a_m, b_m = self.memory.gates(x.view(B, T, C))
+                if torch.is_grad_enabled():  # recompute the loop in backward: saves ~2 state copies per step
+                    m, _ = torch.utils.checkpoint.checkpoint(self.memory.scan, q, k, v, a_m, b_m, use_reentrant=False)
+                else:
+                    m, _ = self.memory.scan(q, k, v, a_m, b_m)
+                y = self.memory.combine(y, m)
 
         if self.rope is not None:
             y = self.rope.out(y, pos)
@@ -395,19 +549,20 @@ class CausalParticleSelfAttention(nn.Module):
         y = y.view(B, N, T, -1)
         return y
 
-    def _forward_cached(self, q, k, v, kv):
+    def _forward_cached(self, q, k, v, kv, x=None):
         # inference with a key/value cache (DLPDynamics.sample(kv_cache=True)): q, k, v hold only the new
         # timesteps, kv['k'], kv['v'] the earlier ones of the same sequence; the new keys/values are appended.
         # Same arithmetic as the manual path above, restricted to the query rows of the new timesteps.
         # Temporal attention only (one particle per sequence, as SpatioTemporalBlock calls it).
         B, nh, T, hs = q.shape
         assert not self.torch_attn and not self.training, "kv cache: inference with the manual attention path only"
-        if self.rope is not None:
-            # rotate the new rows at their position in this cache's sequence (kv['p'] counts every timestep fed,
-            # also those a sliding cache has dropped); only offsets matter, so the cached rows stay valid
+        if self.rope is not None or self.vgain is not None:
+            # position of the new rows in this cache's sequence (kv['p'] counts every timestep fed, also those a
+            # sliding cache has dropped); only offsets matter, so the cached rows stay valid
             p0 = kv.get('p', 0)
             pos = torch.arange(p0, p0 + T, device=q.device)
             kv['p'] = p0 + T
+        if self.rope is not None:
             q, k, v = self.rope.qkv(q, k, v, pos)
         if kv.get('k') is not None:
             k = torch.cat([kv['k'], k], dim=2)
@@ -426,6 +581,15 @@ class CausalParticleSelfAttention(nn.Module):
         att = att.masked_fill(self.mask[0, 0, 0, T_past:T_all, 0, :T_all] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         y = att @ v  # (B, nh, T, hs)
+        if self.vgain is not None:
+            # the cached rows are the newest T_all timesteps fed, ending at the new rows
+            k_pos = torch.arange(p0 + T - T_all, p0 + T, device=q.device)
+            y = y + self.vgain.correction_cached(att, v, pos, k_pos)
+        if self.memory is not None:
+            # the state keeps accumulating over every timestep fed to this cache (not limited to the window)
+            a_m, b_m = self.memory.gates(x.view(B, T, nh * hs))
+            m, kv['S'] = self.memory.scan(q, k[:, :, T_past:], v[:, :, T_past:], a_m, b_m, kv.get('S'))
+            y = self.memory.combine(y, m)
         if self.rope is not None:
             y = self.rope.out(y, pos)
         y = y.transpose(1, 2).contiguous().view(B, T, nh * hs)
@@ -635,7 +799,7 @@ class CausalBlock(nn.Module):
     def __init__(self, n_embed, n_head, block_size, attn_pdrop=0.1, resid_pdrop=0.1, hidden_dim_multiplier=4,
                  positional_bias=False, activation='gelu', max_particles=None, norm_type='rms', context_cond=False,
                  residual_modulation=False, context_gate=False, attn_scale=1.0, temporal_window=None,
-                 temporal_rope=False):
+                 temporal_rope=False, temporal_vgain=False, temporal_memory=False):
         super().__init__()
         self.max_particles = max_particles
         if norm_type == 'rms':
@@ -648,7 +812,8 @@ class CausalBlock(nn.Module):
         self.ln2 = norm_layer(n_embed)
         self.attn = CausalParticleSelfAttention(n_embed, n_head, block_size, attn_pdrop, resid_pdrop,
                                                 positional_bias=positional_bias, max_particles=max_particles,
-                                                temporal_window=temporal_window, temporal_rope=temporal_rope)
+                                                temporal_window=temporal_window, temporal_rope=temporal_rope,
+                                                temporal_vgain=temporal_vgain, temporal_memory=temporal_memory)
         self.mlp = MLP(n_embed, resid_pdrop, hidden_dim_multiplier, activation=activation)
         self.attn_scale = attn_scale
         self.context_cond = context_cond
@@ -692,7 +857,7 @@ class SpatioTemporalBlock(nn.Module):
                  positional_bias=False, activation='gelu', max_particles=None, norm_type='rms', causal=True,
                  context_cond=False, residual_modulation=True, context_gate=False, attn_scale=1.0,
                  cross_attn_cond=False, attention_order=('spatial', 'temporal'), temporal_bias=False,
-                 temporal_window=None, temporal_rope=False):
+                 temporal_window=None, temporal_rope=False, temporal_vgain=False, temporal_memory=False):
         # temporal_bias (opt-in, default off): learned relative time bias in the temporal attention only (one scalar
         # per head per frame offset); the spatial block is left as it is. Exclusive with positional_bias.
         # temporal_window (opt-in, default None): banded causal mask in the temporal attention (causal only)
@@ -704,6 +869,12 @@ class SpatioTemporalBlock(nn.Module):
         # temporal_rope (opt-in, default False): learned rotary time position in the temporal attention (TemporalRotary)
         if temporal_rope and not causal:
             raise ValueError("temporal_rope needs a causal temporal block")
+        # temporal_vgain (opt-in, default False): per-offset value gain in the temporal attention (TemporalValueGain)
+        if temporal_vgain and not causal:
+            raise ValueError("temporal_vgain needs a causal temporal block")
+        # temporal_memory (opt-in, default False): gated delta-rule memory in the temporal attention (TemporalMemory)
+        if temporal_memory and not causal:
+            raise ValueError("temporal_memory needs a causal temporal block")
         self.context_cond = context_cond
         self.residual_modulation = residual_modulation
         self.context_gate = context_gate
@@ -724,7 +895,11 @@ class SpatioTemporalBlock(nn.Module):
         # temporal_bias: time offsets only (max_particles=None), each temporal sequence holds one particle
         window_kw = {} if temporal_window is None else {'temporal_window': temporal_window}
         if temporal_rope:
-            window_kw['temporal_rope'] = True
+            window_kw['temporal_rope'] = temporal_rope
+        if temporal_vgain:
+            window_kw['temporal_vgain'] = True
+        if temporal_memory:
+            window_kw['temporal_memory'] = True
         self.temp_block = temp_block_type(n_embed, n_head, block_size, attn_pdrop,
                                           resid_pdrop, hidden_dim_multiplier,
                                           positional_bias or temporal_bias, activation=activation,
@@ -910,7 +1085,9 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                  pos_embed_t_adaln=False,
                  temporal_pos=None,
                  temporal_window=None,
-                 temporal_rope=False
+                 temporal_rope=False,
+                 temporal_vgain=False,
+                 temporal_memory=False
                  ):
         # temporal_pos (opt-in): None keeps the original behaviour, set by positional_bias / pos_embed_t_adaln.
         #   'rel_bias': no per-timestep embedding; a learned relative time bias in the temporal attention logits,
@@ -932,15 +1109,39 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                 raise ValueError("temporal_window needs a causal transformer")
         # temporal_rope (opt-in, default False): learned rotary time position on the temporal q, k, v (TemporalRotary).
         # Depends only on time offsets like 'rel_bias', so it needs temporal_pos 'rel_bias' / 'none' (no absolute
-        # embedding) and keeps the sliding kv cache valid. Zero-initialized: adding it to a trained model changes nothing.
-        if not isinstance(temporal_rope, bool):
-            raise ValueError(f"temporal_rope must be a bool, got {temporal_rope!r}")
+        # embedding) and keeps the sliding kv cache valid. True: zero-initialized (adding it to a trained model changes
+        # nothing); 'freq': frequency init for training from scratch.
+        check_temporal_rope(temporal_rope)
         if temporal_rope:
             if temporal_pos not in ('rel_bias', 'none'):
                 raise ValueError("temporal_rope needs temporal_pos 'rel_bias' or 'none'")
             if not causal:
                 raise ValueError("temporal_rope needs a causal transformer")
         self.temporal_rope = temporal_rope
+        # temporal_vgain (opt-in, default False): per-offset per-dimension value gain in the temporal attention
+        # (TemporalValueGain); offsets only, same requirements as temporal_rope; starts bitwise as the model without it.
+        if not isinstance(temporal_vgain, bool):
+            raise ValueError(f"temporal_vgain must be a bool, got {temporal_vgain!r}")
+        if temporal_vgain:
+            if temporal_pos not in ('rel_bias', 'none'):
+                raise ValueError("temporal_vgain needs temporal_pos 'rel_bias' or 'none'")
+            if not causal:
+                raise ValueError("temporal_vgain needs a causal transformer")
+            if temporal_rope:
+                raise ValueError("temporal_vgain and temporal_rope are exclusive")
+        self.temporal_vgain = temporal_vgain
+        # temporal_memory (opt-in, default False): gated delta-rule recurrent memory per particle slot next to the
+        # temporal attention (TemporalMemory), meant for a short temporal_window; starts bitwise as the model without it.
+        if not isinstance(temporal_memory, bool):
+            raise ValueError(f"temporal_memory must be a bool, got {temporal_memory!r}")
+        if temporal_memory:
+            if temporal_pos not in ('rel_bias', 'none'):
+                raise ValueError("temporal_memory needs temporal_pos 'rel_bias' or 'none'")
+            if not causal:
+                raise ValueError("temporal_memory needs a causal transformer")
+            if temporal_rope or temporal_vgain:
+                raise ValueError("temporal_memory is exclusive with temporal_rope / temporal_vgain")
+        self.temporal_memory = temporal_memory
         self.temporal_window = temporal_window
         self.temporal_pos = temporal_pos
         self.positional_bias = positional_bias
@@ -997,7 +1198,9 @@ class ParticleSpatioTemporalTransformer(nn.Module):
                                                           cross_attn_cond=self.cond_cross_attn,
                                                           temporal_bias=(temporal_pos == 'rel_bias'),
                                                           temporal_window=temporal_window,
-                                                          temporal_rope=temporal_rope)
+                                                          temporal_rope=temporal_rope,
+                                                          temporal_vgain=temporal_vgain,
+                                                          temporal_memory=temporal_memory)
                                       for _ in range(n_layer)])
 
         # decoder head
@@ -5683,10 +5886,14 @@ class DLPContext(nn.Module):
                  temporal_pos='abs_adaln',  # time position: 'abs_adaln' (original), 'rel_bias' or 'none'
                  temporal_window=None,  # opt-in banded temporal attention, see ParticleSpatioTemporalTransformer
                  temporal_rope=False,  # opt-in rotary time position, see ParticleSpatioTemporalTransformer
+                 temporal_vgain=False,  # opt-in per-offset value gain, see ParticleSpatioTemporalTransformer
+                 temporal_memory=False,  # opt-in recurrent memory, see ParticleSpatioTemporalTransformer
                  ):
         super(DLPContext, self).__init__()
         self.temporal_window = temporal_window
         self.temporal_rope = temporal_rope
+        self.temporal_vgain = temporal_vgain
+        self.temporal_memory = temporal_memory
         pos_embed_t_adaln, self.pte_temporal_pos = resolve_temporal_pos(temporal_pos, pos_embed_t_adaln)
         self.temporal_pos = temporal_pos
         """
@@ -5934,7 +6141,9 @@ class DLPContext(nn.Module):
                                                      pos_embed_t_adaln=self.pos_embed_t_adaln,
                                                      temporal_pos=self.pte_temporal_pos,
                                                      temporal_window=self.temporal_window,
-                                                     temporal_rope=self.temporal_rope)
+                                                     temporal_rope=self.temporal_rope,
+                                                     temporal_vgain=self.temporal_vgain,
+                                                     temporal_memory=self.temporal_memory)
 
         if self.global_ctx_pool:
             # global
@@ -6439,6 +6648,8 @@ class DLPDynamics(nn.Module):
                  temporal_pos='abs_adaln',  # time position: 'abs_adaln' (original), 'rel_bias' or 'none'
                  temporal_window=None,  # opt-in banded temporal attention, see ParticleSpatioTemporalTransformer
                  temporal_rope=False,  # opt-in rotary time position, see ParticleSpatioTemporalTransformer
+                 temporal_vgain=False,  # opt-in per-offset value gain, see ParticleSpatioTemporalTransformer
+                 temporal_memory=False,  # opt-in recurrent memory, see ParticleSpatioTemporalTransformer
                  ):
         super(DLPDynamics, self).__init__()
         if temporal_pos != 'abs_adaln' and positional_bias:
@@ -6612,7 +6823,9 @@ class DLPDynamics(nn.Module):
                                                                       pos_embed_t_adaln=self.pos_embed_t_adaln,
                                                                       temporal_pos=self.pt_temporal_pos,
                                                                       temporal_window=temporal_window,
-                                                                      temporal_rope=temporal_rope)
+                                                                      temporal_rope=temporal_rope,
+                                                                      temporal_vgain=temporal_vgain,
+                                                                      temporal_memory=temporal_memory)
 
         self.particle_decoder = ParticleFeatureDecoderDyn(self.projection_dim, features_dim, bg_features_dim,
                                                           hidden_dim, kp_activation=kp_activation, max_delta=max_delta,

@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 
 from modules.modules import DLPEncoder, DLPDecoder, DLPContext
-from modules.modules import DLPDynamics, TEMPORAL_POS_MODES
+from modules.modules import DLPDynamics, TEMPORAL_POS_MODES, check_temporal_rope
 # util functions
 from utils.util_func import calc_model_size, generate_dlp_logo
 from utils.loss_functions import calc_reconstruction_loss, calc_kl_beta_dist, calc_kl, LossLPIPS, calc_kl_categorical, \
@@ -145,6 +145,12 @@ class DLP(nn.Module):
                  # opt-in learned rotary time position (q, k, v) in the temporal attention of the context/dynamics
                  # transformers; zero-initialized; needs temporal_pos 'rel_bias'/'none' (sliding kv cache stays valid)
                  temporal_rope=False,
+                 # opt-in per-offset per-dimension value gain in the temporal attention of the context/dynamics
+                 # transformers (TemporalValueGain); starts bitwise as the model without it; needs 'rel_bias'/'none'
+                 temporal_vgain=False,
+                 # opt-in gated delta-rule recurrent memory per particle slot next to the temporal attention of the
+                 # context/dynamics transformers (TemporalMemory), for use with a short temporal_window
+                 temporal_memory=False,
                  ):
         super(DLP, self).__init__()
         """
@@ -370,14 +376,33 @@ class DLP(nn.Module):
                 raise ValueError(f"temporal_window must be an int in [1, timestep_horizon={timestep_horizon}], "
                                  f"got {temporal_window!r}")
         self.temporal_window = temporal_window
-        if not isinstance(temporal_rope, bool):
-            raise ValueError(f"temporal_rope must be a bool, got {temporal_rope!r}")
+        check_temporal_rope(temporal_rope)  # False, True (zero init) or 'freq' (frequency init, from scratch)
         if temporal_rope:
             if not self.is_dynamics_model:
                 raise ValueError("temporal_rope only applies to dynamics models (timestep_horizon > 1)")
             if temporal_pos == 'abs_adaln':
                 raise ValueError("temporal_rope needs temporal_pos 'rel_bias' or 'none'")
         self.temporal_rope = temporal_rope
+        if not isinstance(temporal_vgain, bool):
+            raise ValueError(f"temporal_vgain must be a bool, got {temporal_vgain!r}")
+        if temporal_vgain:
+            if not self.is_dynamics_model:
+                raise ValueError("temporal_vgain only applies to dynamics models (timestep_horizon > 1)")
+            if temporal_pos == 'abs_adaln':
+                raise ValueError("temporal_vgain needs temporal_pos 'rel_bias' or 'none'")
+            if temporal_rope:
+                raise ValueError("temporal_vgain and temporal_rope are exclusive")
+        self.temporal_vgain = temporal_vgain
+        if not isinstance(temporal_memory, bool):
+            raise ValueError(f"temporal_memory must be a bool, got {temporal_memory!r}")
+        if temporal_memory:
+            if not self.is_dynamics_model:
+                raise ValueError("temporal_memory only applies to dynamics models (timestep_horizon > 1)")
+            if temporal_pos == 'abs_adaln':
+                raise ValueError("temporal_memory needs temporal_pos 'rel_bias' or 'none'")
+            if temporal_rope or temporal_vgain:
+                raise ValueError("temporal_memory is exclusive with temporal_rope / temporal_vgain")
+        self.temporal_memory = temporal_memory
         # global latent context: EXPERIMENTAL, NOT USED IN THE PAPER
         self.global_ctx_pool = global_ctx_pool
         self.pool_ctx_dim = pool_ctx_dim
@@ -546,6 +571,8 @@ class DLP(nn.Module):
                                          temporal_pos=temporal_pos,
                                          temporal_window=temporal_window,
                                          temporal_rope=temporal_rope,
+                                         temporal_vgain=temporal_vgain,
+                                         temporal_memory=temporal_memory,
                                          )
             self.encoder_module.ctx_enc = self.ctx_module
         else:
@@ -612,6 +639,8 @@ class DLP(nn.Module):
                                           temporal_pos=temporal_pos,
                                           temporal_window=temporal_window,
                                           temporal_rope=temporal_rope,
+                                          temporal_vgain=temporal_vgain,
+                                          temporal_memory=temporal_memory,
                                           )
         else:
             self.dyn_module = nn.Identity()

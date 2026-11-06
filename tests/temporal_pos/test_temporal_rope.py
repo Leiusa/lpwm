@@ -14,7 +14,10 @@ Asserted here (CPU, random weights):
   5. with non-zero rope parameters: outputs change (the rotation is live), and depend only on time offsets (a kv
      cache whose positions start at 37 gives the same outputs as one starting at 0);
   6. kv cache == full forward within the block size; one layer: sliding cache == recomputed window past the block
-     size (transformer and whole model), as for 'rel_bias' without rope.
+     size (transformer and whole model), as for 'rel_bias' without rope;
+  7. temporal_rope='freq' (training from scratch): theta starts log-spaced in [pi / (block_size - 1), pi / 2], the
+     carrier non-zero; with theta forced to 0 the attention equals the model without rope (the carrier is
+     subtracted); 5. and 6. also hold with the 'freq' initial values.
 
     python tests/temporal_pos/test_temporal_rope.py
 """
@@ -79,6 +82,7 @@ def test_strict_checks():
     bad = [
         lambda: build("abs_adaln", extra={"temporal_rope": True}),
         lambda: build("rel_bias", extra={"temporal_rope": 1}),
+        lambda: build("rel_bias", extra={"temporal_rope": "zero"}),
         lambda: ParticleSpatioTemporalTransformer(32, 4, 1, 6, 32, pos_embed_t_adaln=True, temporal_rope=True),
         lambda: ParticleSpatioTemporalTransformer(32, 4, 1, 6, 32, temporal_pos="rel_bias", causal=False,
                                                   temporal_rope=True),
@@ -151,28 +155,35 @@ def test_rope_is_live_and_offset_only():
     g = torch.Generator().manual_seed(0)
     x = torch.randn(b, n, T, f, generator=g)
     c = torch.randn(b, n, T, f, generator=g)
-    torch.manual_seed(0)
-    pt = ParticleSpatioTemporalTransformer(f, 4, 2, T, f, context_cond=True, temporal_pos="rel_bias",
-                                           temporal_rope=True).eval()
-    perturb(pt)
-    with torch.no_grad():
-        for p in rope_params(pt).values():
-            p.zero_()
-        y0 = pt(x, c)
-        set_rope(pt)
-        y1 = pt(x, c)
-        assert (y1 - y0).abs().max() > SENS, "non-zero rope parameters did not change the output"
-        outs = {}
-        for start in (0, 37):
-            cache = pt.new_kv_cache()
-            for kv in cache["layers"]:
-                kv["p"] = start
-            outs[start] = torch.cat([pt(x[:, :, i:i + 1], c[:, :, i:i + 1], kv_cache=cache) for i in range(T)], 2)
-    d_off = (outs[0] - outs[37]).abs().max().item()
-    d_full = (outs[0] - y1).abs().max().item()
-    assert d_off < EXACT_TOL, d_off
-    assert d_full < EXACT_TOL, d_full
-    print(f"    positions from 37 vs from 0: {d_off:.1e}; kv cache vs full forward: {d_full:.1e}")
+    for rope in (True, "freq"):
+        torch.manual_seed(0)
+        pt = ParticleSpatioTemporalTransformer(f, 4, 2, T, f, context_cond=True, temporal_pos="rel_bias",
+                                               temporal_rope=rope).eval()
+        perturb(pt)
+        init = {k: p.detach().clone() for k, p in rope_params(pt).items()}
+        with torch.no_grad():
+            for p in rope_params(pt).values():
+                p.zero_()
+            y0 = pt(x, c)
+            if rope is True:
+                set_rope(pt)
+            else:  # the 'freq' initial values
+                for k, p in rope_params(pt).items():
+                    p.copy_(init[k])
+            y1 = pt(x, c)
+            assert (y1 - y0).abs().max() > SENS, (rope, "non-zero rope parameters did not change the output")
+            outs = {}
+            for start in (0, 37):
+                cache = pt.new_kv_cache()
+                for kv in cache["layers"]:
+                    kv["p"] = start
+                outs[start] = torch.cat([pt(x[:, :, i:i + 1], c[:, :, i:i + 1], kv_cache=cache)
+                                         for i in range(T)], 2)
+        d_off = (outs[0] - outs[37]).abs().max().item()
+        d_full = (outs[0] - y1).abs().max().item()
+        assert d_off < EXACT_TOL, (rope, d_off)
+        assert d_full < EXACT_TOL, (rope, d_full)
+        print(f"    {rope}: positions from 37 vs from 0: {d_off:.1e}; kv cache vs full forward: {d_full:.1e}")
 
 
 def test_slide_one_layer_exact():
@@ -181,12 +192,13 @@ def test_slide_one_layer_exact():
     g = torch.Generator().manual_seed(0)
     x = torch.randn(b, n, 2 * T, f, generator=g)
     c = torch.randn(b, n, 2 * T, f, generator=g)
-    for mode in ("rel_bias", "none"):
+    for mode, rope in (("rel_bias", True), ("none", True), ("rel_bias", "freq")):
         torch.manual_seed(0)
         pt = ParticleSpatioTemporalTransformer(f, 4, 1, T, f, context_cond=True, temporal_pos=mode,
-                                               temporal_rope=True).eval()
+                                               temporal_rope=rope).eval()
         perturb(pt)
-        set_rope(pt)
+        if rope is True:
+            set_rope(pt)
         cache = pt.new_kv_cache(slide=True)
         diffs = []
         with torch.no_grad():
@@ -196,14 +208,15 @@ def test_slide_one_layer_exact():
                 ref = pt(x[:, :, lo:i + 1], c[:, :, lo:i + 1])[:, :, -1:]
                 diffs.append((y - ref).abs().max().item())
         assert max(diffs) < EXACT_TOL, (mode, diffs)
-        print(f"    {mode}: transformer, 1 layer, sliding vs recomputed window worst {max(diffs):.1e}")
+        print(f"    {mode} {rope}: transformer, 1 layer, sliding vs recomputed window worst {max(diffs):.1e}")
 
 
 def test_model_slide_one_layer_exact():
-    for mode in ("rel_bias", "none"):
-        m, cfg = build(mode, extra={"pint_dyn_layers": 1, "pint_ctx_layers": 1, "temporal_rope": True})
+    for mode, rope in (("rel_bias", True), ("none", True), ("rel_bias", "freq")):
+        m, cfg = build(mode, extra={"pint_dyn_layers": 1, "pint_ctx_layers": 1, "temporal_rope": rope})
         perturb(m)
-        set_rope(m)
+        if rope is True:
+            set_rope(m)
         horizon, cond, steps = cfg["timestep_horizon"], 2, 12
         x = frames(cfg, cond + steps)
         ref, sl = rollout(m, x, cond, steps, False), rollout(m, x, cond, steps, "slide")
@@ -213,7 +226,38 @@ def test_model_slide_one_layer_exact():
         kv = rollout(m, x, cond, steps, True)
         d_kv = max((ref[key] - kv[key]).abs().max().item() for key in LATENTS)
         assert d_kv < EXACT_TOL, (mode, d_kv)
-        print(f"    {mode}: model, 1 layer, slide vs recompute past the block size {d:.1e}; kv=True {d_kv:.1e}")
+        print(f"    {mode} {rope}: model, 1 layer, slide vs recompute past the block size {d:.1e}; kv=True {d_kv:.1e}")
+
+
+def test_freq_init():
+    import math
+    from modules.modules import CausalParticleSelfAttention
+    m, cfg = build("rel_bias", extra={"temporal_rope": "freq"})
+    ps = rope_params(m)
+    assert ps
+    for k, p in ps.items():
+        if k.endswith("carrier"):
+            assert p.abs().max() > 0, k
+        else:
+            block = None
+            for name, mod in m.named_modules():
+                if hasattr(mod, "rope") and mod.rope is not None and k.startswith(name + ".rope"):
+                    block = mod.mask.shape[-1]
+            assert block is not None, k
+            lo, hi = math.pi / (block - 1), math.pi / 2
+            assert abs(p.min().item() - lo) < 1e-5 and abs(p.max().item() - hi) < 1e-5, (k, p.min(), p.max())
+    # carrier subtracted: with theta = 0 the attention equals the same layer without rope
+    torch.manual_seed(0)
+    a = CausalParticleSelfAttention(32, 4, 6, 0.0, 0.0, temporal_rope="freq").eval()
+    b = CausalParticleSelfAttention(32, 4, 6, 0.0, 0.0).eval()
+    b.load_state_dict({k: v for k, v in a.state_dict().items() if ".rope." not in k and not k.startswith("rope.")})
+    with torch.no_grad():
+        a.rope.theta_qk.zero_()
+        a.rope.theta_v.zero_()
+        x = torch.randn(3, 1, 6, 32)
+        d = (a(x) - b(x)).abs().max().item()
+    assert a.rope.carrier.abs().max() > 0 and d < EXACT_TOL, d
+    print(f"    'freq': theta = 0 vs no rope {d:.1e}")
 
 
 def main():

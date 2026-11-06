@@ -184,6 +184,8 @@ def load_dlp_from_config(conf_path, ckpt_path=None):
                 temporal_pos=config.get('temporal_pos', 'abs_adaln'),  # time position (opt-in, see models.py)
                 temporal_window=config.get('temporal_window', None),  # banded temporal attention (opt-in)
                 temporal_rope=config.get('temporal_rope', False),  # rotary time position (opt-in)
+                temporal_vgain=config.get('temporal_vgain', False),  # per-offset value gain (opt-in)
+                temporal_memory=config.get('temporal_memory', False),  # recurrent memory (opt-in)
                 )
     if ckpt_path is not None:
         try:
